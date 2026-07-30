@@ -1,52 +1,46 @@
-from kiteconnect import KiteConnect
-from dotenv import load_dotenv
+"""Backward-compatible market-data helper functions."""
+
+from __future__ import annotations
+
 from datetime import datetime
-import pandas as pd
-import os
 
-load_dotenv()
+from broker.zerodha_market_data import ZerodhaMarketDataProvider
+from market_data.historical_loader import HistoricalDataLoader
+from market_data.instrument_manager import InstrumentManager
+from market_data.interval import Interval
+from domain.candle import Candle
 
-API_KEY = os.getenv("API_KEY")
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
-
-kite = KiteConnect(api_key=API_KEY)
-kite.set_access_token(ACCESS_TOKEN)
-
-# Load instrument database
-df = pd.read_csv("data/instruments.csv")
+_default_manager: InstrumentManager | None = None
+_default_provider: ZerodhaMarketDataProvider | None = None
 
 
-def get_token(symbol):
-    symbol = symbol.upper()
+def get_token(symbol: str) -> int:
+    """Return the instrument token for a trading symbol."""
 
-    result = df[df["tradingsymbol"] == symbol]
-
-    if result.empty:
-        raise Exception(f"{symbol} not found.")
-
-    return int(result.iloc[0]["instrument_token"])
+    return _get_default_manager().get_token(symbol)
 
 
-def get_history(symbol, from_date, to_date, interval="5minute"):
+def get_history(
+    symbol: str,
+    from_date: datetime,
+    to_date: datetime,
+    interval: Interval = Interval.FIVE_MINUTE,
+) -> list[Candle]:
+    """Fetch validated historical candles."""
 
-    token = get_token(symbol)
-
-    data = kite.historical_data(
-        instrument_token=token,
-        from_date=from_date,
-        to_date=to_date,
-        interval=interval
-    )
-
-    return pd.DataFrame(data)
+    loader = HistoricalDataLoader(_get_default_provider())
+    return loader.load(symbol, from_date, to_date, interval)
 
 
-if __name__ == "__main__":
+def _get_default_manager() -> InstrumentManager:
+    global _default_manager
+    if _default_manager is None:
+        _default_manager = InstrumentManager()
+    return _default_manager
 
-    candles = get_history(
-        "RELIANCE",
-        datetime(2025, 1, 1),
-        datetime(2025, 1, 5)
-    )
 
-    print(candles.head())
+def _get_default_provider() -> ZerodhaMarketDataProvider:
+    global _default_provider
+    if _default_provider is None:
+        _default_provider = ZerodhaMarketDataProvider(_get_default_manager())
+    return _default_provider

@@ -1,5 +1,5 @@
 from risk.risk_manager import RiskManager
-from models.trade import Trade, TradeDirection
+from domain.trade import Trade, TradeDirection
 
 trade = Trade(
     symbol="RELIANCE",

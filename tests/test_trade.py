@@ -1,4 +1,4 @@
-from models.trade import Trade, TradeDirection
+from domain.trade import Trade, TradeDirection
 
 trade = Trade(
     symbol="RELIANCE",

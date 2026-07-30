@@ -1,5 +1,5 @@
 from datetime import datetime
-from models.candle import Candle
+from domain.candle import Candle
 
 candle = Candle(
     timestamp=datetime.now(),
