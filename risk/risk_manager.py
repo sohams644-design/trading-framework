@@ -1,4 +1,4 @@
-from models.trade import Trade
+from domain.trade import Trade
 
 
 class RiskManager:
