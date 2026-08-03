@@ -9,7 +9,7 @@ The project follows a package-oriented trading framework layout:
 - `indicators/` contains broker-independent, incremental indicator calculations and indicator context orchestration.
 - `market_data/` contains provider abstractions, interval definitions, instrument lookup, validation, repositories, and historical loading.
 - `broker/` contains broker-specific adapters that isolate third-party SDKs from framework code.
-- `risk/` contains risk management and position sizing components.
+- `risk/` contains the risk gate: `RiskContext`, `SafetyChecks`, `TradeLimits`, `PositionSizer`, and the `RiskManager` orchestrator that turns a `Signal` into a `RiskDecision`.
 - `execution/` contains broker integrations and order management.
 - `backtesting/` contains simulation and metrics components.
 - `performance/` contains reporting and performance analytics.
@@ -37,6 +37,8 @@ IndicatorContext
 Indicators
     ↓
 Strategy
+    ↓
+Signal
     ↓
 Risk
     ↓
@@ -96,6 +98,39 @@ Execution
 ```
 
 The strategy's sole responsibility is converting indicator state into domain `Signal` objects. It never places orders, imports broker SDKs, imports pandas, manages portfolio capital, or performs risk sizing.
+
+## Risk layer
+
+Risk sits between Strategy and the (future) Order Manager and is the framework's gatekeeper for money:
+
+```text
+Signal
+    ↓
+RiskContext
+    ↓
+SafetyChecks
+    ↓
+TradeLimits
+    ↓
+PositionSizer
+    ↓
+RiskDecision
+    ↓
+OrderRequest (future)
+    ↓
+Execution
+```
+
+- `RiskDecision` (`domain/risk_decision.py`) is the only outcome the risk gate produces: `approved`, `quantity`, an optional `RejectReason`, and an optional human-readable `message`. There is no separate approved/rejected type; `approved=True`/`False` distinguishes them.
+- `RejectReason` (`domain/risk_decision.py`) is a structured enum — `DAILY_LOSS_LIMIT`, `MAX_TRADES`, `INVALID_SIGNAL`, `INSUFFICIENT_CAPITAL`, `POSITION_LIMIT`, `POSITION_ALREADY_OPEN`, `MARKET_CLOSED`, `SAFETY_CHECK_FAILED` — so rejections drive logic without magic strings; `message` carries the human-readable detail for logs.
+- `RiskConfig` (`config/risk.py`) holds static, configurable thresholds: `max_trades_per_day`, `max_concurrent_positions`, `daily_loss_limit`, `max_capital_exposure`, `capital_allocation_pct`, `allowed_symbols`. `capital_allocation_pct` sizes a trade as a fraction of total capital — a capital-allocation limit, not a stop-loss-aware risk-per-trade limit, since strategies do not yet carry stop-loss data into the risk gate.
+- `RiskContext` (`risk/risk_context.py`) is the mutable, per-day counterpart to `RiskConfig`: current `capital`, `capital_deployed`, `daily_realized_loss`, `trades_today`, `open_positions`, `active_symbols`, `market_open`, and `trading_enabled`. It lives in `risk/` rather than `state/` because it is risk-specific bookkeeping, not the broader order/session/engine state machine `state/` is reserved for.
+- `SafetyChecks` (`risk/safety_checks.py`) gates entries on session and symbol conditions: market open, trading enabled, symbol allow-list, and whether the symbol already has an active position (`POSITION_ALREADY_OPEN`).
+- `TradeLimits` (`risk/trade_limits.py`) gates entries on portfolio-wide exposure: trades per day, concurrent positions, daily realized loss, and total capital deployed.
+- `PositionSizer` (`risk/position_sizer.py`) computes `quantity = int(capital * capital_allocation_pct / entry_price)`, returning `0` for non-positive inputs. It performs no stop-loss, ATR, Kelly, or volatility-based sizing.
+- `RiskManager` (`risk/risk_manager.py`) is the orchestrator and contains no rules itself: it approves exit signals (`EXIT_LONG`/`EXIT_SHORT`) unconditionally via `RiskDecision.approved_exit()` — Risk never blocks or sizes an exit, since blocking a close could trap a losing position — then for entry signals runs `SafetyChecks`, then `TradeLimits`, then `PositionSizer`, short-circuiting on the first rejection.
+
+Risk never imports Zerodha, `ExecutionProvider`, `OrderManager`, or `KiteConnect`; it only knows domain objects, configuration, and its own rules. Building an `OrderRequest` from an approved `RiskDecision` is deferred to a future sprint, since `OrderRequest` needs exchange/order-type/product data that neither `Signal` nor `RiskDecision` carries.
 
 ## Strategy API evolution
 
