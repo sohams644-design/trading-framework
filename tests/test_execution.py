@@ -4,6 +4,9 @@ from datetime import datetime
 import pytest
 
 from broker.zerodha_execution_provider import ZerodhaExecutionProvider
+from domain.candle import Candle
+from domain.risk_decision import RejectReason, RiskDecision
+from domain.signal import Signal
 from domain.trade import TradeDirection
 from execution.exceptions import (
     ExecutionProviderError,
@@ -13,9 +16,11 @@ from execution.exceptions import (
 from execution.execution_result import ExecutionResult, OrderStatus
 from execution.order_manager import OrderManager
 from execution.order_request import OrderRequest, OrderType, Product
+from execution.order_request_builder import OrderRequestBuilder
 from execution.order_validator import OrderValidator
 from execution.paper_broker import PaperExecutionProvider
 from execution.provider import ExecutionProvider
+from execution.simulated_execution_provider import SimulatedExecutionProvider
 
 
 def _order(**overrides) -> OrderRequest:
@@ -385,3 +390,144 @@ def test_zerodha_execution_provider_maps_unrecognized_status_to_unknown_and_warn
 
     assert result.status is OrderStatus.UNKNOWN
     assert "EXPIRED" in caplog.text
+
+
+# --- ExecutionResult.fill_price ---
+
+
+def test_execution_result_fill_price_defaults_to_none():
+    result = ExecutionResult(success=True, status=OrderStatus.FILLED, timestamp=datetime.now())
+
+    assert result.fill_price is None
+
+
+# --- OrderRequestBuilder ---
+
+
+def _candle(timestamp: datetime, close: float) -> Candle:
+    return Candle(timestamp=timestamp, open=close, high=close, low=close, close=close, volume=100)
+
+
+def test_order_request_builder_maps_buy_signal_to_buy_side():
+    builder = OrderRequestBuilder(exchange="NSE")
+    signal = Signal.buy("RELIANCE", datetime(2026, 7, 30, 9, 30), price=100.0, reason="orb_long_breakout")
+    decision = RiskDecision.approved_entry(42)
+
+    order = builder.build(signal, decision)
+
+    assert order.symbol == "RELIANCE"
+    assert order.exchange == "NSE"
+    assert order.side is TradeDirection.BUY
+    assert order.quantity == 42
+    assert order.order_type is OrderType.MARKET
+    assert order.product is Product.INTRADAY
+    assert order.tag == "orb_long_breakout"
+
+
+def test_order_request_builder_maps_exit_long_signal_to_sell_side():
+    builder = OrderRequestBuilder(exchange="NSE")
+    signal = Signal.exit_long("RELIANCE", datetime(2026, 7, 30, 15, 0), price=105.0)
+    decision = RiskDecision.approved_exit()
+
+    order = builder.build(signal, decision, quantity=42)
+
+    assert order.side is TradeDirection.SELL
+    assert order.quantity == 42
+
+
+def test_order_request_builder_maps_exit_short_signal_to_buy_side():
+    builder = OrderRequestBuilder(exchange="NSE")
+    signal = Signal.exit_short("RELIANCE", datetime(2026, 7, 30, 15, 0), price=95.0)
+    decision = RiskDecision.approved_exit()
+
+    order = builder.build(signal, decision, quantity=10)
+
+    assert order.side is TradeDirection.BUY
+    assert order.quantity == 10
+
+
+def test_order_request_builder_quantity_override_takes_precedence():
+    builder = OrderRequestBuilder(exchange="NSE")
+    signal = Signal.buy("RELIANCE", datetime(2026, 7, 30, 9, 30), price=100.0)
+    decision = RiskDecision.approved_entry(42)
+
+    order = builder.build(signal, decision, quantity=7)
+
+    assert order.quantity == 7
+
+
+def test_order_request_builder_rejects_unapproved_decision():
+    builder = OrderRequestBuilder(exchange="NSE")
+    signal = Signal.buy("RELIANCE", datetime(2026, 7, 30, 9, 30), price=100.0)
+    decision = RiskDecision.rejected(RejectReason.MARKET_CLOSED)
+
+    with pytest.raises(ValueError, match="rejected RiskDecision"):
+        builder.build(signal, decision)
+
+
+def test_order_request_builder_rejects_hold_signal():
+    builder = OrderRequestBuilder(exchange="NSE")
+    signal = Signal.none("RELIANCE", datetime(2026, 7, 30, 9, 30))
+    decision = RiskDecision.approved_entry(10)
+
+    with pytest.raises(ValueError, match="cannot be converted to an order"):
+        builder.build(signal, decision)
+
+
+# --- SimulatedExecutionProvider ---
+
+
+def test_simulated_execution_provider_fills_market_order_at_current_candle_close():
+    provider = SimulatedExecutionProvider()
+    provider.advance(_candle(datetime(2026, 7, 30, 9, 30), close=102.5))
+
+    result = provider.place_order(_order())
+
+    assert result.success is True
+    assert result.status is OrderStatus.FILLED
+    assert result.fill_price == 102.5
+    assert result.timestamp == datetime(2026, 7, 30, 9, 30)
+
+
+def test_simulated_execution_provider_rejects_non_market_orders():
+    provider = SimulatedExecutionProvider()
+    provider.advance(_candle(datetime(2026, 7, 30, 9, 30), close=100.0))
+
+    with pytest.raises(ExecutionProviderError, match="only fills MARKET orders"):
+        provider.place_order(_order(order_type=OrderType.LIMIT, price=100.0))
+
+
+def test_simulated_execution_provider_requires_advance_before_placing_orders():
+    provider = SimulatedExecutionProvider()
+
+    with pytest.raises(ExecutionProviderError, match="advance"):
+        provider.place_order(_order())
+
+
+def test_simulated_execution_provider_cancel_and_status_round_trip():
+    provider = SimulatedExecutionProvider()
+    provider.advance(_candle(datetime(2026, 7, 30, 9, 30), close=100.0))
+    placed = provider.place_order(_order())
+
+    cancel_result = provider.cancel_order(placed.broker_order_id)
+    status_result = provider.get_order_status(placed.broker_order_id)
+
+    assert cancel_result.status is OrderStatus.CANCELLED
+    assert status_result.status is OrderStatus.CANCELLED
+    assert status_result.fill_price == 100.0
+
+
+def test_simulated_execution_provider_unknown_order_raises_not_found():
+    provider = SimulatedExecutionProvider()
+
+    with pytest.raises(OrderNotFoundError, match="Unknown simulated order id"):
+        provider.get_order_status("MISSING")
+
+
+def test_simulated_execution_provider_does_not_support_modify():
+    provider = SimulatedExecutionProvider()
+    provider.advance(_candle(datetime(2026, 7, 30, 9, 30), close=100.0))
+    placed = provider.place_order(_order())
+
+    with pytest.raises(ExecutionProviderError, match="does not support modifying"):
+        provider.modify_order(placed.broker_order_id, _order(quantity=5))

@@ -6,6 +6,7 @@ from domain.position import Position
 from domain.risk_decision import RejectReason, RiskDecision
 from domain.signal import Signal, SignalAction
 from domain.trade import Trade, TradeDirection, TradeStatus
+from domain.trade_record import TradeRecord
 
 __all__ = [
     "Candle",
@@ -17,5 +18,6 @@ __all__ = [
     "SignalAction",
     "Trade",
     "TradeDirection",
+    "TradeRecord",
     "TradeStatus",
 ]

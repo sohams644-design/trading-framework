@@ -10,10 +10,11 @@ The project follows a package-oriented trading framework layout:
 - `market_data/` contains provider abstractions, interval definitions, instrument lookup, validation, repositories, and historical loading.
 - `broker/` contains broker-specific adapters that isolate third-party SDKs from framework code.
 - `risk/` contains the risk gate: `RiskContext`, `SafetyChecks`, `TradeLimits`, `PositionSizer`, and the `RiskManager` orchestrator that turns a `Signal` into a `RiskDecision`.
-- `execution/` contains the broker-independent execution pipeline: order contracts (`OrderRequest`, `ExecutionResult`, `OrderStatus`), the `ExecutionProvider` interface, `OrderValidator`, `OrderManager`, and the in-memory `PaperExecutionProvider`.
-- `backtesting/` contains simulation and metrics components.
-- `performance/` contains reporting and performance analytics.
-- `state/` contains state machine support for trading workflows.
+- `execution/` contains the broker-independent execution pipeline: order contracts (`OrderRequest`, `ExecutionResult`, `OrderStatus`), the `ExecutionProvider` interface, `OrderValidator`, `OrderManager`, `OrderRequestBuilder`, and the in-memory `PaperExecutionProvider`/`SimulatedExecutionProvider`.
+- `portfolio/` contains financial bookkeeping shared by backtesting, paper trading, and live trading: `Portfolio` (cash, positions, realized PnL) and `TradeLog`.
+- `performance/` contains pure statistics over completed trades: win rate, average winner/loser, profit factor, and max drawdown.
+- `backtesting/` replays historical candles through every layer above via `Replay`, `BacktestEngine`, and `Results`.
+- `state/` contains state machine support for trading workflows (order/session/engine lifecycle) — distinct from `portfolio/`, which owns financial/accounting state, not lifecycle state.
 - `utils/` contains compatibility helpers for logging, instruments, and market data.
 - `watchdog/` contains health monitoring and emergency controls.
 
@@ -138,7 +139,7 @@ Execution
 - `PositionSizer` (`risk/position_sizer.py`) computes `quantity = int(capital * capital_allocation_pct / entry_price)`, returning `0` for non-positive inputs. It performs no stop-loss, ATR, Kelly, or volatility-based sizing.
 - `RiskManager` (`risk/risk_manager.py`) is the orchestrator and contains no rules itself: it approves exit signals (`EXIT_LONG`/`EXIT_SHORT`) unconditionally via `RiskDecision.approved_exit()` — Risk never blocks or sizes an exit, since blocking a close could trap a losing position — then for entry signals runs `SafetyChecks`, then `TradeLimits`, then `PositionSizer`, short-circuiting on the first rejection.
 
-Risk never imports Zerodha, `ExecutionProvider`, `OrderManager`, or `KiteConnect`; it only knows domain objects, configuration, and its own rules. Building an `OrderRequest` from an approved `RiskDecision` is deferred to a future sprint, since `OrderRequest` needs exchange/order-type/product data that neither `Signal` nor `RiskDecision` carries.
+Risk never imports Zerodha, `ExecutionProvider`, `OrderManager`, or `KiteConnect`; it only knows domain objects, configuration, and its own rules. Converting an approved `RiskDecision` into an `OrderRequest` is `OrderRequestBuilder`'s job (see the Execution layer below), not Risk's.
 
 ## Execution layer
 
@@ -156,18 +157,71 @@ Execution Provider
 Broker Adapter
 ```
 
-This layer builds the contract and orchestration between Risk and the broker. Risk produces a `RiskDecision`; converting an approved `RiskDecision` into an `OrderRequest` is deferred to a future sprint, since `OrderRequest` needs exchange/order-type/product data that neither `Signal` nor `RiskDecision` carries.
-
 - `OrderRequest` (`execution/order_request.py`) is an immutable, broker-independent description of an order: symbol, exchange, `side` (reuses `domain.trade.TradeDirection`), quantity, `OrderType`, `Product`, and optional price/trigger price/tag. It carries no broker-specific fields.
-- `ExecutionResult` (`execution/execution_result.py`) is the immutable outcome of any execution-provider operation: `success`, `status` (`OrderStatus`), `timestamp`, and optional `broker_order_id`/`message`. It never carries broker SDK objects.
+- `ExecutionResult` (`execution/execution_result.py`) is the immutable outcome of any execution-provider operation: `success`, `status` (`OrderStatus`), `timestamp`, and optional `broker_order_id`/`message`/`fill_price`. It never carries broker SDK objects. **TODO (v2):** as fill data grows (filled quantity, partial fills, average price), extract fills into their own `ExecutionFill` object instead of continuing to expand this one.
 - `OrderStatus` (`execution/execution_result.py`) is a broker-independent lifecycle enum: `NEW`, `VALIDATED`, `SUBMITTED`, `PENDING`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`, `REJECTED`, `UNKNOWN`. `UNKNOWN` exists so a broker adapter can surface a status it has never seen before (e.g. a new Kite status added later) without silently mislabeling it as `PENDING`; adapters log a warning whenever they fall back to it.
 - `OrderValidator` (`execution/order_validator.py`) applies framework-level rules only: quantity must be positive, limit orders require a price, stop orders require a trigger price, and the order type/product must be in the (configurable) supported set. It knows nothing about any specific broker's rules.
-- `ExecutionProvider` (`execution/provider.py`) is the abstract interface every broker adapter implements: `place_order`, `cancel_order`, `modify_order`, `get_order_status`. It consumes and returns only framework domain objects, never broker SDK types.
+- `OrderRequestBuilder` (`execution/order_request_builder.py`) is the only place that translates a `Signal` + `RiskDecision` into an `OrderRequest`, keeping Risk and Execution from needing to know about each other. It maps `SignalAction` to `TradeDirection` (`BUY`/`SELL` open; `EXIT_LONG`/`EXIT_SHORT` close in the opposite direction) and accepts an optional `quantity` override, required for exits since Risk approves exits with `quantity=0` (it never sizes a close).
+- `ExecutionProvider` (`execution/provider.py`) is the abstract interface every execution adapter implements: `place_order`, `cancel_order`, `modify_order`, `get_order_status`. It consumes and returns only framework domain objects, never broker SDK types.
 - `OrderManager` (`execution/order_manager.py`) orchestrates a validator and a provider: it validates an `OrderRequest`, returns a locally built `REJECTED` `ExecutionResult` if validation fails (without calling the provider), and otherwise delegates to the `ExecutionProvider`. It has no knowledge of Zerodha or any other broker.
-- `PaperExecutionProvider` (`execution/paper_broker.py`) is a deterministic, in-memory `ExecutionProvider` used for testing and paper trading. It accepts orders, assigns incrementing fake order IDs, and tracks order state without simulating fills, pricing, or market behaviour.
+- `PaperExecutionProvider` (`execution/paper_broker.py`) is a deterministic, in-memory `ExecutionProvider` used for testing order-lifecycle plumbing. It accepts orders and assigns incrementing fake order IDs, but simulates no fills, pricing, or market behaviour.
+- `SimulatedExecutionProvider` (`execution/simulated_execution_provider.py`) fills MARKET orders immediately at whatever price it was last `advance()`-d to (a replayed candle's close, or eventually a live tick). It represents simulated *execution*, not a specific broker — unlike `PaperExecutionProvider`, it exists to produce realistic fills for backtesting and, later, paper trading against live prices. Limit/stop fill simulation, slippage, latency, and partial fills are out of scope for this version.
 - `ZerodhaExecutionProvider` (`broker/zerodha_execution_provider.py`) is the concrete broker adapter. It is the only execution-side module that imports `KiteConnect`: it maps `OrderRequest` fields onto Kite's `place_order`/`cancel_order`/`modify_order`/`order_history` calls and maps Kite's order-status vocabulary back onto `OrderStatus`. It contains no retry logic, no websocket order updates, and no live-trading decision logic.
 
 Execution never calculates indicators, never performs risk management or position sizing, and never knows strategy logic. Strategies never import `execution`, never construct broker orders, and never know `OrderManager` exists.
+
+## Portfolio layer
+
+`Portfolio` (`portfolio/portfolio.py`) owns financial bookkeeping — cash, open positions, and realized PnL — and is shared unchanged by backtesting, paper trading, and live trading. It is not a backtesting concept and does not live under `backtesting/`.
+
+Positions use a **signed-quantity convention**: a positive quantity is a long position, a negative quantity is a short position. This lets one formula, `pnl = (exit_price - entry_price) * signed_quantity`, compute correct PnL for both directions without a separate branch per side. Open positions are reused `domain.Position` objects, keyed by symbol; a small private wrapper adds the `entry_time` needed to build a `TradeRecord`, without adding backtest-only fields to the shared domain type.
+
+- `Portfolio.snapshot()` builds a `RiskContext` from the portfolio's current state (cash, capital deployed, open positions, daily counters), so `RiskManager` never needs to know how a portfolio is implemented.
+- `Portfolio.on_fill(order, result, signal)` reacts to a `FILLED` `ExecutionResult`: opens a position for an entry signal, or closes one for an exit signal, recording a `TradeRecord` (`domain/trade_record.py`) and updating realized PnL and the daily loss counter.
+- `Portfolio.reset_daily_counters()` clears `daily_realized_loss` and `trades_today` at a new session boundary.
+- `TradeLog` (`portfolio/trade_log.py`) is an append-only log of `TradeRecord`s in close order.
+- `TradeRecord` is a domain object, not a backtesting one: paper trading and live trading will produce the same shape of completed-trade record.
+
+## Performance layer
+
+`performance/` computes pure statistics over a list of `TradeRecord`s; it owns no data of its own — `Portfolio`/`TradeLog` own the data, `performance/` only reads it. This keeps trade-statistics math in one place regardless of who is asking (backtesting today; live dashboards or paper-trading reports later).
+
+- `performance/expectancy.py`: `win_rate`, `average_winner`, `average_loser`, `profit_factor` (gross profit ÷ gross loss; `inf` if there are wins and no losses, `0.0` with no data).
+- `performance/drawdown.py`: `max_drawdown`, the largest peak-to-trough drop in cumulative realized PnL across trades in close order. This tracks realized PnL only, not a mark-to-market equity curve.
+
+## Backtesting layer
+
+Backtesting replays historical candles through every layer above, unchanged:
+
+```text
+Historical Candles
+    ↓
+Replay
+    ↓
+IndicatorContext
+    ↓
+Strategy
+    ↓
+Risk
+    ↓
+OrderRequestBuilder
+    ↓
+Order Manager (SimulatedExecutionProvider)
+    ↓
+Portfolio
+    ↓
+Trade Log
+    ↓
+Results
+```
+
+- `Replay` (`backtesting/replay.py`) is deliberately dumb: it yields historical candles one at a time, in order. No indicators, no strategy, no fills — nothing that a live tick feed wouldn't also need to support later.
+- `BacktestEngine` (`backtesting/engine.py`) owns the per-candle loop and contains no rules of its own. For every candle it: detects a new session boundary (reusing `MarketSession.should_reset`, not new logic) and if so resets `IndicatorContext` and the portfolio's daily counters; updates indicators; advances `SimulatedExecutionProvider` to the candle's close; asks the strategy for a signal; for entry/exit signals, snapshots the portfolio into a `RiskContext`, asks `RiskManager` to evaluate, and on approval resolves the order quantity (from the `RiskDecision` for entries, or from the portfolio's actual open position size for exits, since Risk doesn't size exits), builds an `OrderRequest`, submits it through `OrderManager`, and lets `Portfolio` react to the fill.
+- `Results` (`backtesting/results.py`) is a thin adapter: it reads a `TradeLog` and calls into `performance/` to build a `BacktestResults` (trade count, win rate, net PnL, average winner/loser, profit factor, max drawdown) — no metric math is duplicated here.
+
+**Why the day-boundary reset matters:** without it, `VWAP`'s cumulative price/volume and `OpeningRange`'s high/low would silently carry over from one trading day into the next, corrupting every subsequent day's breakout and VWAP checks in a multi-day backtest. `BacktestEngine` resetting `IndicatorContext` at each session boundary is what makes multi-day replay results trustworthy.
+
+Nothing in `Portfolio`, `TradeLog`, `Results`, or `OrderRequestBuilder` depends on `Replay` or historical candles directly — swapping `SimulatedExecutionProvider` for `PaperExecutionProvider`/`ZerodhaExecutionProvider`, and `Replay` for a live feed, reuses the rest of this pipeline unchanged for paper and live trading.
 
 ## Strategy API evolution
 
