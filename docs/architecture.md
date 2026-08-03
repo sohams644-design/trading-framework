@@ -10,7 +10,7 @@ The project follows a package-oriented trading framework layout:
 - `market_data/` contains provider abstractions, interval definitions, instrument lookup, validation, repositories, and historical loading.
 - `broker/` contains broker-specific adapters that isolate third-party SDKs from framework code.
 - `risk/` contains the risk gate: `RiskContext`, `SafetyChecks`, `TradeLimits`, `PositionSizer`, and the `RiskManager` orchestrator that turns a `Signal` into a `RiskDecision`.
-- `execution/` contains broker integrations and order management.
+- `execution/` contains the broker-independent execution pipeline: order contracts (`OrderRequest`, `ExecutionResult`, `OrderStatus`), the `ExecutionProvider` interface, `OrderValidator`, `OrderManager`, and the in-memory `PaperExecutionProvider`.
 - `backtesting/` contains simulation and metrics components.
 - `performance/` contains reporting and performance analytics.
 - `state/` contains state machine support for trading workflows.
@@ -42,7 +42,11 @@ Signal
     ↓
 Risk
     ↓
-Execution
+Order Manager
+    ↓
+Execution Provider
+    ↓
+Broker Adapter
 ```
 
 A future service layer can be inserted without changing strategies:
@@ -94,14 +98,18 @@ Signal
     ↓
 Risk
     ↓
-Execution
+Order Manager
+    ↓
+Execution Provider
+    ↓
+Broker Adapter
 ```
 
 The strategy's sole responsibility is converting indicator state into domain `Signal` objects. It never places orders, imports broker SDKs, imports pandas, manages portfolio capital, or performs risk sizing.
 
 ## Risk layer
 
-Risk sits between Strategy and the (future) Order Manager and is the framework's gatekeeper for money:
+Risk sits between Strategy and Order Manager and is the framework's gatekeeper for money:
 
 ```text
 Signal
@@ -131,6 +139,35 @@ Execution
 - `RiskManager` (`risk/risk_manager.py`) is the orchestrator and contains no rules itself: it approves exit signals (`EXIT_LONG`/`EXIT_SHORT`) unconditionally via `RiskDecision.approved_exit()` — Risk never blocks or sizes an exit, since blocking a close could trap a losing position — then for entry signals runs `SafetyChecks`, then `TradeLimits`, then `PositionSizer`, short-circuiting on the first rejection.
 
 Risk never imports Zerodha, `ExecutionProvider`, `OrderManager`, or `KiteConnect`; it only knows domain objects, configuration, and its own rules. Building an `OrderRequest` from an approved `RiskDecision` is deferred to a future sprint, since `OrderRequest` needs exchange/order-type/product data that neither `Signal` nor `RiskDecision` carries.
+
+## Execution layer
+
+Execution sits below Risk in the framework flow and turns approved order requests into broker acknowledgements:
+
+```text
+Signal
+    ↓
+Risk
+    ↓
+Order Manager
+    ↓
+Execution Provider
+    ↓
+Broker Adapter
+```
+
+This layer builds the contract and orchestration between Risk and the broker. Risk produces a `RiskDecision`; converting an approved `RiskDecision` into an `OrderRequest` is deferred to a future sprint, since `OrderRequest` needs exchange/order-type/product data that neither `Signal` nor `RiskDecision` carries.
+
+- `OrderRequest` (`execution/order_request.py`) is an immutable, broker-independent description of an order: symbol, exchange, `side` (reuses `domain.trade.TradeDirection`), quantity, `OrderType`, `Product`, and optional price/trigger price/tag. It carries no broker-specific fields.
+- `ExecutionResult` (`execution/execution_result.py`) is the immutable outcome of any execution-provider operation: `success`, `status` (`OrderStatus`), `timestamp`, and optional `broker_order_id`/`message`. It never carries broker SDK objects.
+- `OrderStatus` (`execution/execution_result.py`) is a broker-independent lifecycle enum: `NEW`, `VALIDATED`, `SUBMITTED`, `PENDING`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`, `REJECTED`, `UNKNOWN`. `UNKNOWN` exists so a broker adapter can surface a status it has never seen before (e.g. a new Kite status added later) without silently mislabeling it as `PENDING`; adapters log a warning whenever they fall back to it.
+- `OrderValidator` (`execution/order_validator.py`) applies framework-level rules only: quantity must be positive, limit orders require a price, stop orders require a trigger price, and the order type/product must be in the (configurable) supported set. It knows nothing about any specific broker's rules.
+- `ExecutionProvider` (`execution/provider.py`) is the abstract interface every broker adapter implements: `place_order`, `cancel_order`, `modify_order`, `get_order_status`. It consumes and returns only framework domain objects, never broker SDK types.
+- `OrderManager` (`execution/order_manager.py`) orchestrates a validator and a provider: it validates an `OrderRequest`, returns a locally built `REJECTED` `ExecutionResult` if validation fails (without calling the provider), and otherwise delegates to the `ExecutionProvider`. It has no knowledge of Zerodha or any other broker.
+- `PaperExecutionProvider` (`execution/paper_broker.py`) is a deterministic, in-memory `ExecutionProvider` used for testing and paper trading. It accepts orders, assigns incrementing fake order IDs, and tracks order state without simulating fills, pricing, or market behaviour.
+- `ZerodhaExecutionProvider` (`broker/zerodha_execution_provider.py`) is the concrete broker adapter. It is the only execution-side module that imports `KiteConnect`: it maps `OrderRequest` fields onto Kite's `place_order`/`cancel_order`/`modify_order`/`order_history` calls and maps Kite's order-status vocabulary back onto `OrderStatus`. It contains no retry logic, no websocket order updates, and no live-trading decision logic.
+
+Execution never calculates indicators, never performs risk management or position sizing, and never knows strategy logic. Strategies never import `execution`, never construct broker orders, and never know `OrderManager` exists.
 
 ## Strategy API evolution
 

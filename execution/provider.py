@@ -1,0 +1,32 @@
+"""Execution-provider abstraction used by the order manager."""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+from execution.execution_result import ExecutionResult
+from execution.order_request import OrderRequest
+
+
+class ExecutionProvider(ABC):
+    """Interface for broker-backed order execution adapters."""
+
+    @abstractmethod
+    def place_order(self, order: OrderRequest) -> ExecutionResult:
+        """Submit an order and return the resulting execution state."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def cancel_order(self, broker_order_id: str) -> ExecutionResult:
+        """Cancel a previously submitted order."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def modify_order(self, broker_order_id: str, order: OrderRequest) -> ExecutionResult:
+        """Modify a previously submitted order."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_order_status(self, broker_order_id: str) -> ExecutionResult:
+        """Return the current execution state of a previously submitted order."""
+        raise NotImplementedError
