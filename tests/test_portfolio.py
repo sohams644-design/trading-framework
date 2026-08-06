@@ -151,6 +151,47 @@ def test_portfolio_snapshot_reflects_open_positions_and_counters():
     assert context.trading_enabled is False
 
 
+def test_portfolio_on_fill_returns_none_when_opening_a_position():
+    portfolio = Portfolio(cash=100_000.0)
+    entry_signal = Signal.buy("RELIANCE", datetime(2026, 7, 30, 9, 30), price=100.0)
+
+    assert portfolio.on_fill(_order(quantity=10), _filled(100.0), entry_signal) is None
+
+
+def test_portfolio_on_fill_returns_trade_record_when_closing_a_position():
+    portfolio = Portfolio(cash=100_000.0)
+    entry_signal = Signal.buy("RELIANCE", datetime(2026, 7, 30, 9, 30), price=100.0)
+    portfolio.on_fill(_order(quantity=10), _filled(100.0), entry_signal)
+
+    exit_signal = Signal.exit_long("RELIANCE", datetime(2026, 7, 30, 10, 0), price=105.0)
+    trade = portfolio.on_fill(
+        _order(side=TradeDirection.SELL, quantity=10),
+        _filled(105.0, timestamp=datetime(2026, 7, 30, 10, 0)),
+        exit_signal,
+    )
+
+    assert trade is not None
+    assert trade.pnl == 50.0
+    assert trade is portfolio.trade_log.records[0]
+
+
+def test_portfolio_on_fill_returns_none_for_unfilled_result():
+    portfolio = Portfolio(cash=100_000.0)
+    entry_signal = Signal.buy("RELIANCE", datetime(2026, 7, 30, 9, 30), price=100.0)
+    rejected = ExecutionResult(
+        success=False, status=OrderStatus.REJECTED, timestamp=datetime(2026, 7, 30, 9, 30)
+    )
+
+    assert portfolio.on_fill(_order(), rejected, entry_signal) is None
+
+
+def test_portfolio_on_fill_returns_none_when_closing_unknown_symbol():
+    portfolio = Portfolio(cash=100_000.0)
+    exit_signal = Signal.exit_long("RELIANCE", datetime(2026, 7, 30, 10, 0), price=105.0)
+
+    assert portfolio.on_fill(_order(side=TradeDirection.SELL), _filled(105.0), exit_signal) is None
+
+
 def test_portfolio_reset_daily_counters_clears_loss_and_trade_count():
     portfolio = Portfolio(cash=100_000.0, daily_realized_loss=500.0, trades_today=3)
 

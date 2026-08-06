@@ -39,7 +39,11 @@ class SimulatedExecutionProvider(ExecutionProvider):
         self._id_sequence = count(1)
 
     def advance(self, candle: Candle) -> None:
-        """Advance the simulated market to a new candle's close price."""
+        """Advance the simulated market to a new candle's close price.
+
+        Overrides the ``ExecutionProvider`` no-op default: this provider
+        fills against whatever price it was last advanced to.
+        """
 
         self._current_price = candle.close
         self._current_timestamp = candle.timestamp

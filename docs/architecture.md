@@ -13,10 +13,17 @@ The project follows a package-oriented trading framework layout:
 - `execution/` contains the broker-independent execution pipeline: order contracts (`OrderRequest`, `ExecutionResult`, `OrderStatus`), the `ExecutionProvider` interface, `OrderValidator`, `OrderManager`, `OrderRequestBuilder`, and the in-memory `PaperExecutionProvider`/`SimulatedExecutionProvider`.
 - `portfolio/` contains financial bookkeeping shared by backtesting, paper trading, and live trading: `Portfolio` (cash, positions, realized PnL) and `TradeLog`.
 - `performance/` contains pure statistics over completed trades: win rate, average winner/loser, profit factor, and max drawdown.
-- `backtesting/` replays historical candles through every layer above via `Replay`, `BacktestEngine`, and `Results`.
-- `state/` contains state machine support for trading workflows (order/session/engine lifecycle) — distinct from `portfolio/`, which owns financial/accounting state, not lifecycle state.
+- `runtime/` contains the orchestration layer: `RuntimeEngine`, `RuntimeConfig`, and lightweight `RuntimeEvent`s. It coordinates existing components and holds no trading logic of its own.
+- `backtesting/` replays historical candles through the runtime loop via `Replay`, `BacktestEngine`, and `Results`.
+- `state/` contains engine lifecycle state (`RuntimeState`, `RuntimeStatus`) — distinct from `portfolio/`, which owns financial/accounting state, not lifecycle state.
 - `utils/` contains compatibility helpers for logging, instruments, and market data.
 - `watchdog/` contains health monitoring and emergency controls.
+
+## Version 1 architecture freeze
+
+As of Sprint 8 the Version 1 architecture is frozen. The package list above is final: no new top-level packages, no moving files, no renaming layers, and no new architectural concepts unless they solve a genuinely new problem.
+
+Future work should consist of adding implementations, integrations, providers, and improved algorithms inside the existing layers — not reorganizing the project. Every new feature should first answer: *does this belong inside an existing layer, or am I accidentally creating a new architecture?*
 
 ## Domain layer
 
@@ -216,12 +223,65 @@ Results
 ```
 
 - `Replay` (`backtesting/replay.py`) is deliberately dumb: it yields historical candles one at a time, in order. No indicators, no strategy, no fills — nothing that a live tick feed wouldn't also need to support later.
-- `BacktestEngine` (`backtesting/engine.py`) owns the per-candle loop and contains no rules of its own. For every candle it: detects a new session boundary (reusing `MarketSession.should_reset`, not new logic) and if so resets `IndicatorContext` and the portfolio's daily counters; updates indicators; advances `SimulatedExecutionProvider` to the candle's close; asks the strategy for a signal; for entry/exit signals, snapshots the portfolio into a `RiskContext`, asks `RiskManager` to evaluate, and on approval resolves the order quantity (from the `RiskDecision` for entries, or from the portfolio's actual open position size for exits, since Risk doesn't size exits), builds an `OrderRequest`, submits it through `OrderManager`, and lets `Portfolio` react to the fill.
+- `BacktestEngine` (`backtesting/engine.py`) is a thin wrapper over `RuntimeEngine`. It supplies backtest-appropriate configuration (`continue_on_error=False`) and a `Replay` feed; the per-candle pipeline itself lives in `runtime/` so backtesting and live running can never drift apart.
 - `Results` (`backtesting/results.py`) is a thin adapter: it reads a `TradeLog` and calls into `performance/` to build a `BacktestResults` (trade count, win rate, net PnL, average winner/loser, profit factor, max drawdown) — no metric math is duplicated here.
 
-**Why the day-boundary reset matters:** without it, `VWAP`'s cumulative price/volume and `OpeningRange`'s high/low would silently carry over from one trading day into the next, corrupting every subsequent day's breakout and VWAP checks in a multi-day backtest. `BacktestEngine` resetting `IndicatorContext` at each session boundary is what makes multi-day replay results trustworthy.
+**Why the day-boundary reset matters:** without it, `VWAP`'s cumulative price/volume and `OpeningRange`'s high/low would silently carry over from one trading day into the next, corrupting every subsequent day's breakout and VWAP checks in a multi-day backtest. `RuntimeEngine` resetting `IndicatorContext` at each session boundary is what makes multi-day replay results trustworthy.
 
 Nothing in `Portfolio`, `TradeLog`, `Results`, or `OrderRequestBuilder` depends on `Replay` or historical candles directly — swapping `SimulatedExecutionProvider` for `PaperExecutionProvider`/`ZerodhaExecutionProvider`, and `Replay` for a live feed, reuses the rest of this pipeline unchanged for paper and live trading.
+
+## Runtime layer
+
+The runtime is the orchestration layer that continuously feeds candles into everything above. It is deliberately boring: **if it ever starts containing trading rules, the design is wrong.** It never calculates indicators, generates signals, evaluates risk, places broker orders directly, calculates PnL, or knows any strategy's rules — every component it coordinates already exists and is injected.
+
+```text
+Feed (Iterable[Candle])
+    ↓
+RuntimeEngine ── owns ──> RuntimeState
+    ↓
+IndicatorContext → Strategy → Risk → OrderRequestBuilder → OrderManager → Portfolio
+```
+
+- `RuntimeEngine` (`runtime/engine.py`) owns the loop and lifecycle: `run(feed)`, `process_candle(candle)`, `pause()`, `resume()`, `stop()`.
+- `RuntimeConfig` (`runtime/config.py`) is immutable configuration: the `MarketSession` and `continue_on_error`. It deliberately does **not** carry symbol/exchange/order-type/product (those already live on the injected `OrderRequestBuilder`) nor any per-execution metadata.
+- `RuntimeState`/`RuntimeStatus` (`state/runtime_state.py`) carry per-execution metadata: `runtime_id`, status (`NOT_STARTED`/`RUNNING`/`PAUSED`/`STOPPED`), `last_processed_candle`, `current_session_date`, `candles_processed`, `error_count`, `started_at`/`stopped_at`. `runtime_id` lives here rather than in `RuntimeConfig` because it describes one running instance, not immutable configuration.
+
+### The feed is just an iterable
+
+There is no `MarketFeed` class and no `Scheduler`. A feed is any `Iterable[Candle]`: `Replay` for history (finite, iterates immediately), or a future live feed wrapping `MarketDataProvider.stream_ticks` (whose iterator blocks until a real tick arrives). Pacing is the feed's concern; from the engine's perspective `for candle in feed` looks identical either way. Inventing a class for something the stdlib already expresses would add indirection without adding capability.
+
+### One candle, end to end
+
+1. Record the candle on `RuntimeState` and emit `CANDLE_RECEIVED`.
+2. If `MarketSession.should_reset` reports a new session, reset `IndicatorContext` and `Portfolio.reset_daily_counters()`, then emit `SESSION_ROLLED`.
+3. Update `IndicatorContext`; call `ExecutionProvider.advance(candle)`.
+4. If paused, stop here — a paused engine still observes candles and keeps indicators warm, but takes no action.
+5. Ask the strategy for a `Signal`. Non-entry/non-exit signals end the candle.
+6. Snapshot the portfolio into a `RiskContext` and ask `RiskManager` to evaluate. A rejection emits `TRADE_REJECTED` (with its `RejectReason`) and ends the candle.
+7. Resolve quantity: from the `RiskDecision` for entries, or from the portfolio's actual open position size for exits (Risk approves exits without sizing them).
+8. Build the `OrderRequest`, submit it through `OrderManager`, and let `Portfolio` react to the fill. `Portfolio.on_fill` returns a `TradeRecord` when a position actually closed, which is what drives `TRADE_CLOSED`.
+
+### `ExecutionProvider.advance()`
+
+`ExecutionProvider.advance(candle)` is a default no-op on the base class. `SimulatedExecutionProvider` overrides it to track the current fill price; `PaperExecutionProvider` and `ZerodhaExecutionProvider` inherit the no-op, because a real broker does not need to be told the current price. This keeps the runtime free of `hasattr` checks or provider-type special cases — the contract is explicit rather than a hidden protocol.
+
+### Error handling
+
+Each pipeline stage (strategy, risk, execution) is wrapped separately, so one kind of failure is never mistaken for another. On a stage error the engine logs with the stage name and candle, emits `ERROR_OCCURRED`, increments `error_count`, and skips the rest of that candle. Whether it then continues depends on `continue_on_error`, which separates two genuinely different operating modes: a live engine should survive a recoverable error and keep running (`True`), while a backtest should fail loudly rather than silently skip a bad candle and report misleading results (`False`). A failure raised by the feed itself is caught around the loop, logged, and stops the engine — reconnect/retry logic belongs to a live feed's own implementation, not the engine.
+
+### Runtime events
+
+`RuntimeEvent` (`runtime/events.py`) is an enum of notable points — runtime started/stopped/paused/resumed, candle received, session rolled, signal generated, trade rejected, order submitted/filled, trade closed, error occurred. `RuntimeEngine` accepts one optional `on_event` callback (`Callable[[RuntimeEvent, dict], None]`).
+
+This is intentionally **not** an event framework: no bus, no registry, no dispatcher, no listener base class. It exists so future consumers (dashboard, notifications, watchdog, metrics) have an obvious place to listen without the engine knowing who cares. A callback that raises is logged and swallowed — a broken listener must never break a running engine.
+
+### Logging
+
+Standard-library `logging.getLogger(__name__)`, matching `broker/zerodha_execution_provider.py`. Every line is prefixed with `runtime_id` so concurrent or sequential runs stay traceable. Candle receipt logs at DEBUG (too frequent for INFO on a live feed); signals, risk decisions, orders, trades, and lifecycle transitions log at INFO; stage failures log at ERROR with traceback.
+
+### Future compatibility
+
+Paper trading and live Zerodha are provider swaps (`SimulatedExecutionProvider` / `ZerodhaExecutionProvider`) plus a feed swap — no engine changes. A dashboard reads `Portfolio`, `TradeLog`, `RuntimeState`, and `performance/`, all already plain inspectable objects. A watchdog observes `RuntimeState` (e.g. a stale `last_processed_candle` during market hours) and can call `stop()`. Notifications hook the event callback. Multiple strategies or symbols run as one `RuntimeEngine` instance each; a shared-capital multi-strategy allocator is a genuinely new concept deferred to Version 2 rather than pre-solved here.
 
 ## Strategy API evolution
 

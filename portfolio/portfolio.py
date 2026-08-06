@@ -71,16 +71,26 @@ class Portfolio:
         self.daily_realized_loss = 0.0
         self.trades_today = 0
 
-    def on_fill(self, order: OrderRequest, result: ExecutionResult, signal: Signal) -> None:
-        """React to a fill by opening or closing a position."""
+    def on_fill(
+        self, order: OrderRequest, result: ExecutionResult, signal: Signal
+    ) -> TradeRecord | None:
+        """React to a fill by opening or closing a position.
+
+        Returns the ``TradeRecord`` if this fill closed a position, or None
+        if it opened one or was not actionable. Callers that need to know
+        whether a trade completed should use the return value rather than
+        inspecting the trade log's length.
+        """
 
         if result.status is not OrderStatus.FILLED or result.fill_price is None:
-            return
+            return None
 
         if signal.is_entry:
             self._open(order, result, signal)
-        elif signal.is_exit:
-            self._close(order, result, signal)
+            return None
+        if signal.is_exit:
+            return self._close(order, result, signal)
+        return None
 
     def _open(self, order: OrderRequest, result: ExecutionResult, signal: Signal) -> None:
         signed_quantity = (
@@ -97,29 +107,31 @@ class Portfolio:
         )
         self.trades_today += 1
 
-    def _close(self, order: OrderRequest, result: ExecutionResult, signal: Signal) -> None:
+    def _close(
+        self, order: OrderRequest, result: ExecutionResult, signal: Signal
+    ) -> TradeRecord | None:
         open_position = self._open_positions.pop(order.symbol, None)
         if open_position is None:
-            return
+            return None
 
         position = open_position.position
         self.cash += result.fill_price * position.quantity
         pnl = (result.fill_price - position.average_price) * position.quantity
         direction = TradeDirection.BUY if position.quantity > 0 else TradeDirection.SELL
 
-        self.trade_log.record(
-            TradeRecord(
-                symbol=order.symbol,
-                direction=direction,
-                entry_price=position.average_price,
-                exit_price=result.fill_price,
-                quantity=abs(position.quantity),
-                pnl=pnl,
-                entry_time=open_position.entry_time,
-                exit_time=signal.timestamp,
-                reason=signal.reason,
-            )
+        trade = TradeRecord(
+            symbol=order.symbol,
+            direction=direction,
+            entry_price=position.average_price,
+            exit_price=result.fill_price,
+            quantity=abs(position.quantity),
+            pnl=pnl,
+            entry_time=open_position.entry_time,
+            exit_time=signal.timestamp,
+            reason=signal.reason,
         )
+        self.trade_log.record(trade)
         self.realized_pnl += pnl
         if pnl < 0:
             self.daily_realized_loss += -pnl
+        return trade
