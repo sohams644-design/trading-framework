@@ -65,6 +65,59 @@ def test_build_runner_composes_a_paper_session(monkeypatch):
     assert type(runner._engine.execution_provider).__name__ == "SimulatedExecutionProvider"
 
 
+def test_print_banner_reports_version_and_settings(monkeypatch, capsys):
+    from version import __version__
+
+    runner = _fake_runner()
+
+    run_paper.print_banner(runner)
+
+    output = capsys.readouterr().out
+    assert f"v{__version__}" in output
+    assert "PAPER TRADING (simulated fills)" in output
+    assert "ORBStrategy" in output
+    assert "RELIANCE (NSE)" in output
+    assert "minute" in output
+    assert "INR 50,000.00" in output
+    assert "8f3a2d7c" in output
+
+
+def test_print_banner_is_ascii_safe_for_cp1252_consoles():
+    """A rupee sign here would crash startup on a cp1252 console."""
+
+    import io
+
+    runner = _fake_runner()
+    buffer = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+
+    import contextlib
+
+    with contextlib.redirect_stdout(buffer):
+        run_paper.print_banner(runner)
+    buffer.flush()
+
+
+def _fake_runner():
+    from market_data.interval import Interval
+
+    class FakeRunner:
+        def __init__(self):
+            self.strategy = type("ORBStrategy", (), {})()
+            self.config = type(
+                "C",
+                (),
+                {
+                    "symbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "starting_capital": 50_000.0,
+                    "live_feed": type("F", (), {"interval": Interval.ONE_MINUTE})(),
+                },
+            )()
+            self.state = type("S", (), {"runtime_id": "8f3a2d7c"})()
+
+    return FakeRunner()
+
+
 def test_main_reports_auth_failure_without_traceback(monkeypatch, capsys):
     from broker.zerodha_auth import ZerodhaAuthError
 
@@ -104,7 +157,11 @@ def test_print_summary_uses_existing_performance_calculations(capsys):
             )
             self.trade_log = self.portfolio.trade_log
             self.config = type("C", (), {"symbol": "RELIANCE"})()
-            self.state = type("S", (), {"candles_processed": 375, "error_count": 0})()
+            self.state = type(
+                "S",
+                (),
+                {"candles_processed": 375, "error_count": 0, "runtime_id": "8f3a2d7c"},
+            )()
 
     run_paper.print_summary(FakeRunner())
 

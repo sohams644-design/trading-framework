@@ -21,6 +21,9 @@ from market_data.instrument_manager import InstrumentManager
 from market_data.interval import Interval
 from runtime.paper_trading import PaperTradingRunner
 from strategies.orb import ORBStrategy
+from version import __version__
+
+logger = logging.getLogger("run_paper")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -72,11 +75,44 @@ def build_runner(args: argparse.Namespace) -> PaperTradingRunner:
     )
 
 
+def print_banner(runner: PaperTradingRunner) -> None:
+    """Announce the exact build and settings that produced this session.
+
+    Deliberately ASCII: a rupee sign raises UnicodeEncodeError on consoles
+    using cp1252, which would kill the process at startup.
+    """
+
+    config = runner.config
+    line = "=" * 62
+    print(line)
+    print(f" Trading Framework v{__version__}  |  PAPER TRADING (simulated fills)")
+    print(line)
+    print(f" Strategy:    {type(runner.strategy).__name__}")
+    print(f" Symbol:      {config.symbol} ({config.exchange})")
+    print(f" Interval:    {config.live_feed.interval.value}")
+    print(f" Capital:     INR {config.starting_capital:,.2f}")
+    print(f" Runtime ID:  {runner.state.runtime_id}")
+    print(line)
+
+    # Also recorded in the log stream, so archived logs stay traceable.
+    logger.info(
+        "Trading Framework v%s | paper trading | strategy=%s symbol=%s "
+        "interval=%s capital=%.2f runtime_id=%s",
+        __version__,
+        type(runner.strategy).__name__,
+        config.symbol,
+        config.live_feed.interval.value,
+        config.starting_capital,
+        runner.state.runtime_id,
+    )
+
+
 def print_summary(runner: PaperTradingRunner) -> None:
     """Report the session using the existing performance calculations."""
 
     results = Results().calculate(runner.trade_log)
     print("\n--- Paper trading summary ---")
+    print(f"Version:        v{__version__} (runtime {runner.state.runtime_id})")
     print(f"Symbol:         {runner.config.symbol}")
     print(f"Candles:        {runner.state.candles_processed}")
     print(f"Errors:         {runner.state.error_count}")
@@ -103,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
     except ZerodhaAuthError as error:
         print(f"Authentication failed: {error}", file=sys.stderr)
         return 1
+
+    print_banner(runner)
 
     try:
         runner.run()

@@ -99,6 +99,12 @@ class PaperTradingRunner:
         self._feed.stop()
 
     @property
+    def strategy(self) -> BaseStrategy:
+        """Return the strategy this session is running."""
+
+        return self._engine.strategy
+
+    @property
     def portfolio(self) -> Portfolio:
         """Return the portfolio this session is trading."""
 
