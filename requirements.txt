@@ -1,0 +1,8 @@
+# Broker SDK. Imported only inside broker/ adapters.
+kiteconnect>=5.2
+
+# Loads .env into the environment for config/settings.py.
+python-dotenv>=1.0
+
+# Tests.
+pytest>=8.0

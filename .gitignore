@@ -1,6 +1,9 @@
 # Environment variables
 .env
 
+# Cached broker access token (a live credential - never commit)
+data/zerodha_token.json
+
 # Python virtual environments
 .venv/
 venv/
