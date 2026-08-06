@@ -7,7 +7,7 @@ The project follows a package-oriented trading framework layout:
 - `models/` contains compatibility exports for domain objects while callers migrate to `domain/` imports.
 - `strategies/` contains strategy interfaces and concrete strategy implementations.
 - `indicators/` contains broker-independent, incremental indicator calculations and indicator context orchestration.
-- `market_data/` contains provider abstractions, interval definitions, instrument lookup, validation, repositories, and historical loading.
+- `market_data/` contains provider abstractions, interval definitions, instrument lookup, validation, repositories, historical loading, and the live feed (`LiveMarketFeed`, `TickAggregator`).
 - `broker/` contains broker-specific adapters that isolate third-party SDKs from framework code.
 - `risk/` contains the risk gate: `RiskContext`, `SafetyChecks`, `TradeLimits`, `PositionSizer`, and the `RiskManager` orchestrator that turns a `Signal` into a `RiskDecision`.
 - `execution/` contains the broker-independent execution pipeline: order contracts (`OrderRequest`, `ExecutionResult`, `OrderStatus`), the `ExecutionProvider` interface, `OrderValidator`, `OrderManager`, `OrderRequestBuilder`, and the in-memory `PaperExecutionProvider`/`SimulatedExecutionProvider`.
@@ -71,9 +71,70 @@ MarketDataProvider
 Broker Adapter
 ```
 
-The `MarketDataProvider` interface defines historical candles, live quotes, and tick streaming. All provider methods expose framework `list[Candle]` values, so strategy code never depends on broker payloads, pandas data frames, REST responses, CSV files, or database rows. The Zerodha adapter implements this interface and is the only market-data component that imports `KiteConnect`.
+The `MarketDataProvider` interface defines historical candles, live quotes, and tick streaming. All provider methods expose framework `list[Candle]` values, so strategy code never depends on broker payloads, pandas data frames, REST responses, CSV files, or database rows. The Zerodha adapter implements this interface and is the only market-data component that imports `KiteConnect` and `KiteTicker`.
 
 Historical data loading is separated from strategy logic. A strategy requests candles through `HistoricalDataLoader.load(symbol, from_date, to_date, interval)`, where `interval` is a typed `Interval` enum value. The loader validates candles before returning them so malformed broker data fails early.
+
+## Live market feed
+
+`LiveMarketFeed` (`market_data/live_feed.py`) is the live counterpart to `Replay`. Both are simply `Iterable[Candle]`, so `RuntimeEngine` cannot tell them apart — that interchangeability is the entire point of the layer.
+
+```text
+KiteTicker  ──[SDK thread]──▶  ZerodhaMarketDataProvider.stream_ticks()
+                                            │
+                              [drain thread]│  private to LiveMarketFeed
+                                            ▼
+                                     private queue
+                                            │
+                              [runtime thread] timed get
+                                            ▼
+                                     TickAggregator
+                                            ▼
+                                   completed Candle ──▶ RuntimeEngine
+```
+
+### The provider contract means exactly one thing
+
+`MarketDataProvider.stream_ticks(symbols) -> Iterator[list[Candle]]` yields ticks. It has no heartbeat value, no sentinel, no empty-batch convention, and no timeout parameter. Every broker adapter, present and future, implements that one meaning and hides its own threading model behind it.
+
+Ticks are represented as degenerate candles (`open == high == low == close == last price`), following the convention `get_live_quote` already established. **A tick candle's `volume` is the broker's cumulative day volume, not bar volume.** That overload is a known wart of reusing `Candle` for ticks; introducing a proper `Tick` domain object is a documented Version 2 candidate, deferred here because it would change a frozen interface.
+
+### Why LiveMarketFeed owns a thread
+
+A broker tick stream is push-based and blocking; the runtime is pull-based and must wake periodically to close an elapsed candle. Once a consumer enters `for ticks in provider.stream_ticks(...)` it cannot run any code until the provider yields — that is a property of Python generators, not a design choice. So `LiveMarketFeed` runs the provider on a private daemon thread that drains ticks onto a private queue, and the runtime thread performs a timed `get` on that queue.
+
+The queue, the thread, the sentinel that terminates it, and all synchronization are private to `LiveMarketFeed`. Nothing outside the class can observe them, and `RuntimeEngine`, Strategy, Risk, and Portfolio all remain single-threaded. Both threads stay inside `market_data/`.
+
+Without this, the final candle of a session would never be emitted, and a quiet symbol's candle would stall until its next tick arrived.
+
+### Tick aggregation
+
+`TickAggregator` (`market_data/tick_aggregator.py`) turns ticks into bars and is entirely broker-independent, holding no connection state.
+
+Bucket starts are floored to the interval **anchored on `session.market_open`**, not the clock hour, so 15-minute buckets are 09:15/09:30/09:45 and align with how `OpeningRange` already reasons about the session. Emitted candles are timestamped with the bucket start, making live candles interchangeable with historical ones.
+
+Within a bucket: **open** is the first tick's price, **high**/**low** are running extremes, **close** is the latest price, and **volume** is `latest_cumulative - baseline_cumulative`. The baseline is the *previous* bucket's final cumulative figure, so no traded volume is lost between bars; the first bucket after connecting measures from its own first tick instead, which undercounts that bar by a single tick rather than treating a mid-session connect as if the whole day traded in one bar. A cumulative figure that moves backwards means the broker reset it, and the baseline resets with it.
+
+**This volume delta is a correctness requirement, not an optimisation.** Passing cumulative volume through unconverted would make `RelativeVolume` compare day-cumulative figures against a rolling average of day-cumulative figures, silently rendering every ORB entry filter meaningless with no error raised.
+
+`has_open_bucket` makes flush-at-close an explicit check rather than a `None` test at each call site. Ticks belonging to an already-emitted bucket are dropped with a warning rather than retroactively mutating history.
+
+### Session, reconnect, and failure
+
+Ticks outside `session.is_market_open(...)` are dropped, so pre-open and post-close noise never reaches indicators. **Day-boundary resets are not handled here** — `RuntimeEngine` already owns them via `MarketSession.should_reset`, and duplicating that would reintroduce exactly the drift Sprint 8 removed. There is no holiday calendar; on a holiday the feed simply receives no ticks and idles.
+
+On disconnect the feed reconnects with exponential backoff and **retains the open bucket**, so a brief outage mid-candle resumes the same bar instead of discarding partial data. Only once `max_reconnect_attempts` is exhausted does it flush the open candle and raise — which lands in `RuntimeEngine._handle_feed_failure`, recording an abnormal end. Reaching market close instead ends iteration cleanly, so `error_count` stays meaningful. Malformed ticks are dropped with a warning; one bad tick never kills a session.
+
+Logging covers connection established, **first candle received** (a connection is not necessarily delivering market data yet), reconnect attempts, reconnect exhaustion, candles emitted (DEBUG), and market close.
+
+### Import-cycle note
+
+`LiveFeedConfig` needs `Interval` from `market_data`, while `market_data.live_feed` needs `LiveFeedConfig` from `config`. Neither is re-exported from its package `__init__`, since doing so makes `import config` and `import market_data` mutually recursive. Import them from their modules directly:
+
+```python
+from config.live_feed import LiveFeedConfig
+from market_data.live_feed import LiveMarketFeed
+```
 
 ## Indicator layer
 
