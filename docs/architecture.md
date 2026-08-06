@@ -13,7 +13,7 @@ The project follows a package-oriented trading framework layout:
 - `execution/` contains the broker-independent execution pipeline: order contracts (`OrderRequest`, `ExecutionResult`, `OrderStatus`), the `ExecutionProvider` interface, `OrderValidator`, `OrderManager`, `OrderRequestBuilder`, and the in-memory `PaperExecutionProvider`/`SimulatedExecutionProvider`.
 - `portfolio/` contains financial bookkeeping shared by backtesting, paper trading, and live trading: `Portfolio` (cash, positions, realized PnL) and `TradeLog`.
 - `performance/` contains pure statistics over completed trades: win rate, average winner/loser, profit factor, and max drawdown.
-- `runtime/` contains the orchestration layer: `RuntimeEngine`, `RuntimeConfig`, and lightweight `RuntimeEvent`s. It coordinates existing components and holds no trading logic of its own.
+- `runtime/` contains the orchestration layer: `RuntimeEngine`, `RuntimeConfig`, lightweight `RuntimeEvent`s, and the `PaperTradingRunner` composition. It coordinates existing components and holds no trading logic of its own.
 - `backtesting/` replays historical candles through the runtime loop via `Replay`, `BacktestEngine`, and `Results`.
 - `state/` contains engine lifecycle state (`RuntimeState`, `RuntimeStatus`) — distinct from `portfolio/`, which owns financial/accounting state, not lifecycle state.
 - `utils/` contains compatibility helpers for logging, instruments, and market data.
@@ -122,6 +122,8 @@ Within a bucket: **open** is the first tick's price, **high**/**low** are runnin
 ### Session, reconnect, and failure
 
 Ticks outside `session.is_market_open(...)` are dropped, so pre-open and post-close noise never reaches indicators. **Day-boundary resets are not handled here** — `RuntimeEngine` already owns them via `MarketSession.should_reset`, and duplicating that would reintroduce exactly the drift Sprint 8 removed. There is no holiday calendar; on a holiday the feed simply receives no ticks and idles.
+
+Termination means the session has **ended**, not merely that the clock is outside session hours: a feed started before the opening bell idles and waits rather than exiting, since a paper or live session is realistically launched before the market opens.
 
 On disconnect the feed reconnects with exponential backoff and **retains the open bucket**, so a brief outage mid-candle resumes the same bar instead of discarding partial data. Only once `max_reconnect_attempts` is exhausted does it flush the open candle and raise — which lands in `RuntimeEngine._handle_feed_failure`, recording an abnormal end. Reaching market close instead ends iteration cleanly, so `error_count` stays meaningful. Malformed ticks are dropped with a warning; one bad tick never kills a session.
 
@@ -343,6 +345,39 @@ Standard-library `logging.getLogger(__name__)`, matching `broker/zerodha_executi
 ### Future compatibility
 
 Paper trading and live Zerodha are provider swaps (`SimulatedExecutionProvider` / `ZerodhaExecutionProvider`) plus a feed swap — no engine changes. A dashboard reads `Portfolio`, `TradeLog`, `RuntimeState`, and `performance/`, all already plain inspectable objects. A watchdog observes `RuntimeState` (e.g. a stale `last_processed_candle` during market hours) and can call `stop()`. Notifications hook the event callback. Multiple strategies or symbols run as one `RuntimeEngine` instance each; a shared-capital multi-strategy allocator is a genuinely new concept deferred to Version 2 rather than pre-solved here.
+
+## Paper trading
+
+Paper trading is **not another engine**. It is a composition of components that already exist:
+
+```text
+LiveMarketFeed  →  RuntimeEngine  →  Strategy → Risk → OrderRequestBuilder → OrderManager
+                                                                                  │
+                                                                    SimulatedExecutionProvider
+                                                                                  │
+                                                                              Portfolio → TradeLog
+```
+
+It lives in `runtime/paper_trading.py` rather than its own package, because it introduces no new concept — the same reasoning that makes `BacktestEngine` a thin wrapper rather than a parallel engine. Nothing upstream of `OrderManager` knows which execution provider is in use.
+
+- `PaperTradingRunner` (`runtime/paper_trading.py`) assembles a `LiveMarketFeed`, a `RuntimeEngine`, a `SimulatedExecutionProvider`, and a `Portfolio`, then exposes `run()`, `stop()`, and read-only `portfolio`/`trade_log`/`state`. It holds no positions, computes no PnL, evaluates no risk, and knows no strategy rules.
+- `PaperTradingConfig` (`config/paper_trading.py`) carries what no component config owns — `symbol`, `exchange`, `starting_capital` — and aggregates `LiveFeedConfig` and `RiskConfig`. Like `LiveFeedConfig`, it is **not** re-exported from `config/__init__.py`, for the same import-cycle reason.
+
+Two things justify the runner existing at all rather than inline wiring. The **same** `SimulatedExecutionProvider` instance must reach both the `OrderManager` and the `RuntimeEngine`; passing two would leave one armed with prices via `advance()` and the other placing orders, raising `ExecutionProviderError` on the first trade. And `stop()` shuts down the engine and the feed together, instead of relying on generator finalisation to tear down the feed's background thread.
+
+There is deliberately **no `start()`**: a non-blocking start would mean another thread, and the only threading in this framework exists because the broker SDK is callback-driven. `run()` blocks; `stop()` is safe to call from a signal handler because it only sets an event.
+
+**Performance is not recomputed here.** The runner exposes `trade_log`, and the caller runs the existing `performance/` functions over it — exactly as backtesting does. `backtesting.Results` is deliberately not imported, since `backtesting/` already depends on `runtime/` and the reverse edge would close an import cycle. That `Results` is generic enough to belong in `performance/` is a known Version 1 imperfection, left in place because the architecture freeze forbids moving files.
+
+One session is one strategy, one symbol, one trading day. `Portfolio` is in-memory, so capital and trade history reset on each run; scheduling across days, multiple symbols, and multi-strategy allocation are Version 2 concerns.
+
+### Paper trading versus live trading
+
+Becoming live trading means changing one line — swapping `SimulatedExecutionProvider` for `ZerodhaExecutionProvider`, whose inherited no-op `advance()` makes the swap safe. Three differences remain genuinely open for Version 2, and are worth naming rather than glossing over:
+
+- **Fills stop being instantaneous.** A real order can be pending, partially filled, rejected, or cancelled. `Portfolio.on_fill` correctly ignores non-`FILLED` results, which means live position state needs order-status reconciliation that paper trading never exercises.
+- **Access tokens expire daily.** `settings.access_token` is read once at import.
+- **No slippage or latency is modelled**, so paper results are optimistic by construction. Fills occur at the close of the candle that produced the signal — the same simplification backtesting makes, deliberately, so paper and backtest results agree.
 
 ## Strategy API evolution
 

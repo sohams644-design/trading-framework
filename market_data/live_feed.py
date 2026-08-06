@@ -148,9 +148,16 @@ class LiveMarketFeed:
         return candle
 
     def _market_has_closed(self) -> bool:
+        """Return whether the session has *ended*, not merely whether we are outside it.
+
+        Before the open the feed must idle and wait, not terminate: a paper or
+        live session is realistically started before the bell, and treating
+        "not yet open" as "closed" would end the run before the first tick.
+        """
+
         if not self.config.stop_at_market_close:
             return False
-        return not self.config.session.is_market_open(self._now())
+        return self._now().time() > self.config.session.market_close
 
     def _start_drain(self) -> None:
         self._drain_thread = threading.Thread(

@@ -1,3 +1,4 @@
+import time
 from collections.abc import Iterator
 from datetime import datetime
 
@@ -305,6 +306,35 @@ def test_live_feed_ends_when_market_closes():
 
     # The open bucket is still flushed on the way out.
     assert len(candles) == 1
+
+
+def test_live_feed_waits_before_the_open_instead_of_terminating():
+    """A session started before the bell must idle, not exit immediately.
+
+    The wait matters: the bug only shows when the queue is genuinely empty
+    long enough for an idle poll to run the market-close check, which is
+    exactly what happens between process start and the opening bell.
+    """
+
+    class SlowStartProvider(FakeProvider):
+        def stream_ticks(self, symbols):
+            self.stream_calls += 1
+            time.sleep(0.05)
+            yield [_tick(9, 30, 5, 100.0, 1000)]
+
+    feed = LiveMarketFeed(
+        SlowStartProvider([]),
+        "RELIANCE",
+        config=LiveFeedConfig(poll_timeout_seconds=0.01, stop_at_market_close=True),
+        now=lambda: datetime(2026, 7, 30, 9, 0),
+    )
+
+    candles = list(feed)
+
+    # Before the fix this returned [] because "not yet open" was read as
+    # "market closed", killing the feed on its first idle poll.
+    assert len(candles) == 1
+    assert candles[0].timestamp == datetime(2026, 7, 30, 9, 30)
 
 
 def test_live_feed_flushes_an_elapsed_candle_while_idle():
