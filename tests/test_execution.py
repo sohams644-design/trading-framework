@@ -446,6 +446,18 @@ def test_order_request_builder_maps_exit_short_signal_to_buy_side():
     assert order.quantity == 10
 
 
+def test_order_request_builder_carries_signal_price_through_to_order():
+    builder = OrderRequestBuilder(exchange="NSE")
+    signal = Signal.exit_long(
+        "RELIANCE", datetime(2026, 7, 30, 11, 0), price=98.75, reason="stop_loss"
+    )
+    decision = RiskDecision.approved_exit()
+
+    order = builder.build(signal, decision, quantity=10)
+
+    assert order.price == 98.75
+
+
 def test_order_request_builder_quantity_override_takes_precedence():
     builder = OrderRequestBuilder(exchange="NSE")
     signal = Signal.buy("RELIANCE", datetime(2026, 7, 30, 9, 30), price=100.0)
@@ -478,7 +490,7 @@ def test_order_request_builder_rejects_hold_signal():
 
 
 def test_simulated_execution_provider_fills_market_order_at_current_candle_close():
-    provider = SimulatedExecutionProvider()
+    provider = SimulatedExecutionProvider(slippage_bps=0.0)
     provider.advance(_candle(datetime(2026, 7, 30, 9, 30), close=102.5))
 
     result = provider.place_order(_order())
@@ -487,6 +499,29 @@ def test_simulated_execution_provider_fills_market_order_at_current_candle_close
     assert result.status is OrderStatus.FILLED
     assert result.fill_price == 102.5
     assert result.timestamp == datetime(2026, 7, 30, 9, 30)
+
+
+def test_simulated_execution_provider_fills_at_explicit_order_price_over_candle_close():
+    """A stop/target exit supplies its own trigger price as order.price; the
+    provider must fill there instead of at whatever the candle closed at."""
+
+    provider = SimulatedExecutionProvider(slippage_bps=0.0)
+    provider.advance(_candle(datetime(2026, 7, 30, 9, 30), close=102.5))
+
+    result = provider.place_order(_order(price=99.0))
+
+    assert result.fill_price == 99.0
+
+
+def test_simulated_execution_provider_applies_slippage_adverse_to_side():
+    provider = SimulatedExecutionProvider(slippage_bps=10.0)
+    provider.advance(_candle(datetime(2026, 7, 30, 9, 30), close=100.0))
+
+    buy_result = provider.place_order(_order(side=TradeDirection.BUY))
+    sell_result = provider.place_order(_order(side=TradeDirection.SELL))
+
+    assert buy_result.fill_price == pytest.approx(100.10)
+    assert sell_result.fill_price == pytest.approx(99.90)
 
 
 def test_simulated_execution_provider_rejects_non_market_orders():
@@ -505,7 +540,7 @@ def test_simulated_execution_provider_requires_advance_before_placing_orders():
 
 
 def test_simulated_execution_provider_cancel_and_status_round_trip():
-    provider = SimulatedExecutionProvider()
+    provider = SimulatedExecutionProvider(slippage_bps=0.0)
     provider.advance(_candle(datetime(2026, 7, 30, 9, 30), close=100.0))
     placed = provider.place_order(_order())
 
@@ -525,7 +560,7 @@ def test_simulated_execution_provider_unknown_order_raises_not_found():
 
 
 def test_simulated_execution_provider_does_not_support_modify():
-    provider = SimulatedExecutionProvider()
+    provider = SimulatedExecutionProvider(slippage_bps=0.0)
     provider.advance(_candle(datetime(2026, 7, 30, 9, 30), close=100.0))
     placed = provider.place_order(_order())
 

@@ -497,6 +497,7 @@ def test_runtime_engine_consumes_a_live_feed_exactly_like_a_replay():
     from execution.order_manager import OrderManager
     from execution.order_request_builder import OrderRequestBuilder
     from execution.simulated_execution_provider import SimulatedExecutionProvider
+    from indicators.atr import ATR
     from indicators.context import IndicatorContext
     from indicators.opening_range import OpeningRange
     from indicators.relative_volume import RelativeVolume
@@ -510,6 +511,7 @@ def test_runtime_engine_consumes_a_live_feed_exactly_like_a_replay():
     indicator_context.register("vwap", VWAP())
     indicator_context.register("opening_range", OpeningRange())
     indicator_context.register("relative_volume", RelativeVolume(lookback_period=2))
+    indicator_context.register("atr", ATR(period=2))
 
     execution_provider = SimulatedExecutionProvider()
     portfolio = Portfolio(cash=100_000.0)

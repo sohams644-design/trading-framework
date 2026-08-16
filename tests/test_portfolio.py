@@ -1,9 +1,12 @@
 from datetime import datetime
 
+import pytest
+
 from domain.signal import Signal
 from domain.trade import TradeDirection
 from execution.execution_result import ExecutionResult, OrderStatus
 from execution.order_request import OrderRequest, OrderType, Product
+from performance.charges_calculator import ChargesCalculator
 from portfolio.portfolio import Portfolio
 
 
@@ -64,9 +67,12 @@ def test_portfolio_closes_long_position_records_trade_and_pnl():
         exit_signal,
     )
 
+    charges = ChargesCalculator().calculate_intraday(buy_price=100.0, sell_price=105.0, quantity=10)
+    net_pnl = 50.0 - charges.total
+
     assert "RELIANCE" not in portfolio.positions
-    assert portfolio.cash == 100_050.0
-    assert portfolio.realized_pnl == 50.0
+    assert portfolio.cash == pytest.approx(100_050.0 - charges.total)
+    assert portfolio.realized_pnl == pytest.approx(net_pnl)
     assert len(portfolio.trade_log) == 1
 
     record = portfolio.trade_log.records[0]
@@ -74,7 +80,8 @@ def test_portfolio_closes_long_position_records_trade_and_pnl():
     assert record.entry_price == 100.0
     assert record.exit_price == 105.0
     assert record.quantity == 10
-    assert record.pnl == 50.0
+    assert record.pnl == pytest.approx(net_pnl)
+    assert record.charges == charges.total
     assert record.reason == "opposite_breakout_exit"
 
 
@@ -90,10 +97,15 @@ def test_portfolio_closes_short_position_records_trade_and_pnl():
         exit_signal,
     )
 
-    assert portfolio.realized_pnl == 50.0
+    # Short round-trips sell-then-buy: the entry (100) is the sell leg, the
+    # exit (95) is the buy leg -- the reverse mapping of a long.
+    charges = ChargesCalculator().calculate_intraday(buy_price=95.0, sell_price=100.0, quantity=10)
+    net_pnl = 50.0 - charges.total
+
+    assert portfolio.realized_pnl == pytest.approx(net_pnl)
     record = portfolio.trade_log.records[0]
     assert record.direction is TradeDirection.SELL
-    assert record.pnl == 50.0
+    assert record.pnl == pytest.approx(net_pnl)
 
 
 def test_portfolio_tracks_daily_realized_loss_on_losing_trade():
@@ -108,8 +120,11 @@ def test_portfolio_tracks_daily_realized_loss_on_losing_trade():
         exit_signal,
     )
 
-    assert portfolio.realized_pnl == -100.0
-    assert portfolio.daily_realized_loss == 100.0
+    charges = ChargesCalculator().calculate_intraday(buy_price=100.0, sell_price=90.0, quantity=10)
+    net_loss = 100.0 + charges.total
+
+    assert portfolio.realized_pnl == pytest.approx(-net_loss)
+    assert portfolio.daily_realized_loss == pytest.approx(net_loss)
 
 
 def test_portfolio_on_fill_ignores_non_filled_results():
@@ -170,8 +185,9 @@ def test_portfolio_on_fill_returns_trade_record_when_closing_a_position():
         exit_signal,
     )
 
+    charges = ChargesCalculator().calculate_intraday(buy_price=100.0, sell_price=105.0, quantity=10)
     assert trade is not None
-    assert trade.pnl == 50.0
+    assert trade.pnl == pytest.approx(50.0 - charges.total)
     assert trade is portfolio.trade_log.records[0]
 
 

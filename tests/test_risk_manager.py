@@ -92,3 +92,44 @@ def test_risk_manager_rejects_when_sized_quantity_is_zero():
 
     assert decision.approved is False
     assert decision.reason is RejectReason.INSUFFICIENT_CAPITAL
+
+
+def test_risk_manager_uses_risk_based_sizing_when_signal_carries_a_stop_loss():
+    # capital_allocation_pct is set generously (0.25) so it doesn't cap the
+    # risk-based result -- that interaction is covered separately below.
+    manager = RiskManager(RiskConfig(risk_per_trade_pct=0.01, capital_allocation_pct=0.25))
+    # Risk budget = 100_000 * 0.01 = 1_000; risk/share = |100 - 95| = 5 -> 200 shares.
+    # Capital-allocation sizing (ignoring the stop) would instead give 250 shares.
+    signal = Signal.buy(
+        "RELIANCE", datetime(2026, 7, 30, 9, 30), price=100.0, stop_loss=95.0
+    )
+
+    decision = manager.evaluate(signal, _context())
+
+    assert decision.approved is True
+    assert decision.quantity == 200
+
+
+def test_risk_manager_caps_risk_based_sizing_at_capital_allocation_pct():
+    # A tight stop would otherwise demand 200 shares (risk budget 1_000 /
+    # risk-per-share 5), but capital_allocation_pct=0.1 caps any single
+    # position at 100 shares (100_000 * 0.1 / 100) regardless of the stop.
+    manager = RiskManager(RiskConfig(risk_per_trade_pct=0.01, capital_allocation_pct=0.1))
+    signal = Signal.buy(
+        "RELIANCE", datetime(2026, 7, 30, 9, 30), price=100.0, stop_loss=95.0
+    )
+
+    decision = manager.evaluate(signal, _context())
+
+    assert decision.approved is True
+    assert decision.quantity == 100
+
+
+def test_risk_manager_falls_back_to_capital_allocation_without_a_stop_loss():
+    manager = RiskManager(RiskConfig(risk_per_trade_pct=0.01, capital_allocation_pct=0.1))
+    signal = Signal.buy("RELIANCE", datetime(2026, 7, 30, 9, 30), price=100.0)
+
+    decision = manager.evaluate(signal, _context())
+
+    assert decision.approved is True
+    assert decision.quantity == 100

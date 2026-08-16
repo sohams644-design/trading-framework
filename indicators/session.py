@@ -39,6 +39,21 @@ class MarketSession:
 
         return timestamp.time() >= self.square_off_time
 
+    def is_within_entry_window(self, timestamp: datetime, entry_window_minutes: int) -> bool:
+        """Return whether new entries are still allowed for the session.
+
+        The window opens when the opening range completes and closes
+        ``entry_window_minutes`` later -- an ORB strategy has no business
+        signaling a fresh breakout entry hours after the open, since the
+        move it's meant to catch has typically already happened by then.
+        """
+
+        range_end = self._datetime_for(timestamp, self.market_open) + timedelta(
+            minutes=self.opening_range_minutes
+        )
+        window_end = range_end + timedelta(minutes=entry_window_minutes)
+        return timestamp < window_end
+
     def should_reset(self, previous: datetime | None, current: datetime) -> bool:
         """Return whether indicator state should reset for a new session."""
 

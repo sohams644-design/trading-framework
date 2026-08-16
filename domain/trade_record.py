@@ -21,3 +21,7 @@ class TradeRecord:
     entry_time: datetime
     exit_time: datetime
     reason: str | None = None
+    charges: float = 0.0
+    stop_loss: float | None = None
+    mae: float | None = None
+    mfe: float | None = None

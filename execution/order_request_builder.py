@@ -63,5 +63,6 @@ class OrderRequestBuilder:
             quantity=resolved_quantity,
             order_type=self.order_type,
             product=self.product,
+            price=signal.price,
             tag=signal.reason,
         )

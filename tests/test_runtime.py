@@ -11,6 +11,7 @@ from execution.order_request import OrderRequest, OrderType, Product
 from execution.order_request_builder import OrderRequestBuilder
 from execution.paper_broker import PaperExecutionProvider
 from execution.simulated_execution_provider import SimulatedExecutionProvider
+from indicators.atr import ATR
 from indicators.context import IndicatorContext
 from indicators.opening_range import OpeningRange
 from indicators.relative_volume import RelativeVolume
@@ -45,6 +46,7 @@ def _build_runtime(
     indicator_context.register("vwap", VWAP())
     indicator_context.register("opening_range", OpeningRange())
     indicator_context.register("relative_volume", RelativeVolume(lookback_period=2))
+    indicator_context.register("atr", ATR(period=2))
 
     execution_provider = SimulatedExecutionProvider()
     portfolio = Portfolio(cash=100_000.0)
@@ -112,7 +114,7 @@ def test_execution_provider_advance_defaults_to_noop():
 
 
 def test_simulated_execution_provider_overrides_advance():
-    provider = SimulatedExecutionProvider()
+    provider = SimulatedExecutionProvider(slippage_bps=0.0)
     provider.advance(_candle(datetime(2026, 7, 30), 9, 15, 101, 90, 99, 100))
 
     order = OrderRequest(
@@ -232,6 +234,7 @@ def test_runtime_engine_isolates_risk_errors():
     indicator_context.register("vwap", VWAP())
     indicator_context.register("opening_range", OpeningRange())
     indicator_context.register("relative_volume", RelativeVolume(lookback_period=2))
+    indicator_context.register("atr", ATR(period=2))
 
     execution_provider = SimulatedExecutionProvider()
     portfolio = Portfolio(cash=100_000.0)

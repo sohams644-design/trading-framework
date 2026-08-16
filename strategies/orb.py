@@ -23,7 +23,16 @@ class PositionState(Enum):
 
 
 class ORBStrategy(BaseStrategy):
-    """Converts indicator state into ORB entry and exit signals."""
+    """Converts indicator state into ORB entry and exit signals.
+
+    Entries are gated by: one trade per symbol per day, only within
+    ``entry_window_minutes`` of the opening range completing, a breakout
+    confirmed by an ATR buffer (not a bare tick above the level), a VWAP
+    trend filter, and an RVOL participation filter. Once in a trade, the
+    stop is the tighter of the opening-range extreme and an ATR-based
+    distance, the target is a fixed R-multiple of that risk, and the stop
+    trails (in ATRs) once the trade is far enough ahead.
+    """
 
     def __init__(
         self,
@@ -39,6 +48,10 @@ class ORBStrategy(BaseStrategy):
         self.stop_loss: float | None = None
         self.profit_target: float | None = None
         self.trade_taken_today = False
+        self._initial_risk: float | None = None
+        self._favorable_extreme: float | None = None
+        self._adverse_extreme: float | None = None
+        self._trailing_active = False
 
     def generate_signal(self, candle: Candle, context: IndicatorContext) -> Signal:
         """Generate an ORB signal from indicator state."""
@@ -64,6 +77,10 @@ class ORBStrategy(BaseStrategy):
         self.stop_loss = None
         self.profit_target = None
         self.trade_taken_today = False
+        self._initial_risk = None
+        self._favorable_extreme = None
+        self._adverse_extreme = None
+        self._trailing_active = False
 
     def _build_entry_signal(
         self,
@@ -73,6 +90,10 @@ class ORBStrategy(BaseStrategy):
         if self.position_state is not PositionState.FLAT:
             return None
         if self.trade_taken_today:
+            return None
+        if not self.config.session.is_within_entry_window(
+            candle.timestamp, self.config.entry_window_minutes
+        ):
             return None
         if self.config.session.is_square_off_time(candle.timestamp):
             return None
@@ -91,6 +112,8 @@ class ORBStrategy(BaseStrategy):
                 candle.timestamp,
                 candle.close,
                 reason="orb_long_breakout",
+                stop_loss=self.stop_loss,
+                target=self.profit_target,
             )
 
         if self._short_entry(candle, context):
@@ -103,6 +126,8 @@ class ORBStrategy(BaseStrategy):
                 candle.timestamp,
                 candle.close,
                 reason="orb_short_breakout",
+                stop_loss=self.stop_loss,
+                target=self.profit_target,
             )
 
         return None
@@ -113,21 +138,27 @@ class ORBStrategy(BaseStrategy):
         context: IndicatorContext,
     ) -> None:
         self.entry_price = candle.close
+        atr = context.atr.value or 0.0
 
         if self.position_state is PositionState.LONG:
-            self.stop_loss = context.opening_range.opening_low
+            atr_stop = self.entry_price - self.config.stop_atr_multiplier * atr
+            range_stop = context.opening_range.opening_low
+            self.stop_loss = max(atr_stop, range_stop)
             risk = self.entry_price - self.stop_loss
-            self.profit_target = (
-                self.entry_price
-                + risk * self.config.risk_reward_ratio
-            )
+            self.profit_target = self.entry_price + risk * self.config.risk_reward_ratio
         elif self.position_state is PositionState.SHORT:
-            self.stop_loss = context.opening_range.opening_high
+            atr_stop = self.entry_price + self.config.stop_atr_multiplier * atr
+            range_stop = context.opening_range.opening_high
+            self.stop_loss = min(atr_stop, range_stop)
             risk = self.stop_loss - self.entry_price
-            self.profit_target = (
-                self.entry_price
-                - risk * self.config.risk_reward_ratio
-            )
+            self.profit_target = self.entry_price - risk * self.config.risk_reward_ratio
+        else:
+            return
+
+        self._initial_risk = risk
+        self._favorable_extreme = self.entry_price
+        self._adverse_extreme = self.entry_price
+        self._trailing_active = False
 
     def _log_trade_entry(
         self,
@@ -148,6 +179,8 @@ class ORBStrategy(BaseStrategy):
             "RVOL:\n"
             "  %s\n"
             "VWAP:\n"
+            "  %s\n"
+            "ATR:\n"
             "  %s",
             candle.timestamp,
             context.opening_range.opening_high,
@@ -157,7 +190,51 @@ class ORBStrategy(BaseStrategy):
             self.profit_target,
             context.relative_volume.current_volume_ratio,
             context.vwap.value,
+            context.atr.value,
         )
+
+    def _track_excursions_and_trail_stop(
+        self,
+        candle: Candle,
+        context: IndicatorContext,
+    ) -> None:
+        """Update MAE/MFE tracking and ratchet the trailing stop, if active.
+
+        Runs once per candle while a position is open, before exit checks,
+        so the stop used to check this candle's exit already reflects this
+        candle's own high/low. That mirrors how a live trailing stop would
+        behave intrabar, but it is a simplification worth naming plainly:
+        the stop can move and be hit within the same bar.
+        """
+
+        if self.entry_price is None or self._initial_risk is None or self._initial_risk <= 0:
+            return
+
+        atr = context.atr.value
+
+        if self.position_state is PositionState.LONG:
+            self._favorable_extreme = max(self._favorable_extreme, candle.high)
+            self._adverse_extreme = min(self._adverse_extreme, candle.low)
+            favorable_move = self._favorable_extreme - self.entry_price
+            if atr is not None and favorable_move >= (
+                self.config.trailing_activation_r * self._initial_risk
+            ):
+                trailing_stop = self._favorable_extreme - self.config.trailing_atr_multiplier * atr
+                if self.stop_loss is not None and trailing_stop > self.stop_loss:
+                    self.stop_loss = trailing_stop
+                    self._trailing_active = True
+
+        elif self.position_state is PositionState.SHORT:
+            self._favorable_extreme = min(self._favorable_extreme, candle.low)
+            self._adverse_extreme = max(self._adverse_extreme, candle.high)
+            favorable_move = self.entry_price - self._favorable_extreme
+            if atr is not None and favorable_move >= (
+                self.config.trailing_activation_r * self._initial_risk
+            ):
+                trailing_stop = self._favorable_extreme + self.config.trailing_atr_multiplier * atr
+                if self.stop_loss is not None and trailing_stop < self.stop_loss:
+                    self.stop_loss = trailing_stop
+                    self._trailing_active = True
 
     def _stop_loss_exit(
         self,
@@ -166,23 +243,19 @@ class ORBStrategy(BaseStrategy):
         if self.stop_loss is None:
             return None
 
+        reason = "trailing_stop" if self._trailing_active else "stop_loss"
+
         if (
             self.position_state is PositionState.LONG
             and candle.low <= self.stop_loss
         ):
-            return self._exit_current_position(
-                candle,
-                "stop_loss",
-            )
+            return self._exit_current_position(candle, reason, price=self.stop_loss)
 
         if (
             self.position_state is PositionState.SHORT
             and candle.high >= self.stop_loss
         ):
-            return self._exit_current_position(
-                candle,
-                "stop_loss",
-            )
+            return self._exit_current_position(candle, reason, price=self.stop_loss)
 
         return None
 
@@ -198,8 +271,7 @@ class ORBStrategy(BaseStrategy):
             and candle.high >= self.profit_target
         ):
             return self._exit_current_position(
-                candle,
-                "profit_target",
+                candle, "profit_target", price=self.profit_target
             )
 
         if (
@@ -207,8 +279,7 @@ class ORBStrategy(BaseStrategy):
             and candle.low <= self.profit_target
         ):
             return self._exit_current_position(
-                candle,
-                "profit_target",
+                candle, "profit_target", price=self.profit_target
             )
 
         return None
@@ -221,13 +292,17 @@ class ORBStrategy(BaseStrategy):
         if self.position_state is PositionState.FLAT:
             return None
 
-        stop_exit = self._stop_loss_exit(candle)
-        if stop_exit is not None:
-            return stop_exit
+        self._track_excursions_and_trail_stop(candle, context)
 
-        target_exit = self._profit_target_exit(candle)
-        if target_exit is not None:
-            return target_exit
+        if self.config.use_stop_loss:
+            stop_exit = self._stop_loss_exit(candle)
+            if stop_exit is not None:
+                return stop_exit
+
+        if self.config.use_profit_target:
+            target_exit = self._profit_target_exit(candle)
+            if target_exit is not None:
+                return target_exit
 
         if self.config.exit_at_market_close and self.config.session.is_square_off_time(
             candle.timestamp
@@ -240,19 +315,29 @@ class ORBStrategy(BaseStrategy):
         return None
 
     def _long_entry(self, candle: Candle, context: IndicatorContext) -> bool:
+        atr = context.atr.value
+        if atr is None:
+            return False
+        confirmation_buffer = self.config.breakout_confirmation_atr_multiplier * atr
         return (
             self.config.allow_long
             and context.opening_range.breakout_above
             and context.vwap.value is not None
             and candle.close > context.vwap.value
+            and candle.close > context.opening_range.opening_high + confirmation_buffer
         )
 
     def _short_entry(self, candle: Candle, context: IndicatorContext) -> bool:
+        atr = context.atr.value
+        if atr is None:
+            return False
+        confirmation_buffer = self.config.breakout_confirmation_atr_multiplier * atr
         return (
             self.config.allow_short
             and context.opening_range.breakout_below
             and context.vwap.value is not None
             and candle.close < context.vwap.value
+            and candle.close < context.opening_range.opening_low - confirmation_buffer
         )
 
     def _entry_filters_ready(self, context: IndicatorContext) -> bool:
@@ -260,6 +345,7 @@ class ORBStrategy(BaseStrategy):
             context.opening_range.range_complete
             and context.vwap.ready
             and context.relative_volume.ready
+            and context.atr.ready
         )
 
     def _relative_volume_confirmed(self, context: IndicatorContext) -> bool:
@@ -288,17 +374,47 @@ class ORBStrategy(BaseStrategy):
 
         return None
 
-    def _exit_current_position(self, candle: Candle, reason: str) -> Signal:
+    def _exit_current_position(
+        self,
+        candle: Candle,
+        reason: str,
+        price: float | None = None,
+    ) -> Signal:
+        fill_price = price if price is not None else candle.close
+        metadata = {"mae": self._current_mae(), "mfe": self._current_mfe()}
+
         if self.position_state is PositionState.LONG:
             self.position_state = PositionState.FLAT
             return Signal.exit_long(
-                self.symbol, candle.timestamp, candle.close, reason=reason
+                self.symbol, candle.timestamp, fill_price, reason=reason, metadata=metadata
             )
 
         self.position_state = PositionState.FLAT
         return Signal.exit_short(
-            self.symbol, candle.timestamp, candle.close, reason=reason
+            self.symbol, candle.timestamp, fill_price, reason=reason, metadata=metadata
         )
+
+    def _current_mae(self) -> float | None:
+        """Maximum adverse excursion so far: worst move against the trade."""
+
+        if self._adverse_extreme is None or self.entry_price is None:
+            return None
+        if self.position_state is PositionState.LONG:
+            return self.entry_price - self._adverse_extreme
+        if self.position_state is PositionState.SHORT:
+            return self._adverse_extreme - self.entry_price
+        return None
+
+    def _current_mfe(self) -> float | None:
+        """Maximum favorable excursion so far: best move in the trade's favor."""
+
+        if self._favorable_extreme is None or self.entry_price is None:
+            return None
+        if self.position_state is PositionState.LONG:
+            return self._favorable_extreme - self.entry_price
+        if self.position_state is PositionState.SHORT:
+            return self.entry_price - self._favorable_extreme
+        return None
 
     def _reset_if_new_session(self, candle: Candle) -> None:
         previous_timestamp = self._last_candle.timestamp if self._last_candle else None

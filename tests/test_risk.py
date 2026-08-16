@@ -182,3 +182,61 @@ def test_position_sizer_returns_zero_for_invalid_inputs(capital, entry_price, ca
     sizer = PositionSizer()
 
     assert sizer.calculate_quantity(capital, entry_price, capital_allocation_pct) == 0
+
+
+def test_position_sizer_by_risk_sizes_to_the_configured_risk_budget():
+    sizer = PositionSizer()
+
+    # Risk budget = 100_000 * 0.01 = 1_000. Risk per share = |100 - 95| = 5.
+    # 1_000 / 5 = 200 shares.
+    quantity = sizer.calculate_quantity_by_risk(
+        capital=100_000.0, entry_price=100.0, stop_loss=95.0, risk_per_trade_pct=0.01
+    )
+
+    assert quantity == 200
+
+
+def test_position_sizer_by_risk_gives_a_tighter_stop_a_larger_position():
+    sizer = PositionSizer()
+
+    tight_stop_qty = sizer.calculate_quantity_by_risk(
+        capital=100_000.0, entry_price=100.0, stop_loss=99.0, risk_per_trade_pct=0.01
+    )
+    wide_stop_qty = sizer.calculate_quantity_by_risk(
+        capital=100_000.0, entry_price=100.0, stop_loss=90.0, risk_per_trade_pct=0.01
+    )
+
+    assert tight_stop_qty > wide_stop_qty
+
+
+def test_position_sizer_by_risk_is_capped_by_max_capital_allocation():
+    sizer = PositionSizer()
+
+    # A 1-rupee stop would otherwise demand 1_000 shares (1_000/1), well
+    # beyond what 10% of capital at price 100 can actually buy (100 shares).
+    quantity = sizer.calculate_quantity_by_risk(
+        capital=100_000.0,
+        entry_price=100.0,
+        stop_loss=99.0,
+        risk_per_trade_pct=0.01,
+        max_capital_allocation_pct=0.1,
+    )
+
+    assert quantity == 100
+
+
+@pytest.mark.parametrize(
+    ("capital", "entry_price", "stop_loss", "risk_per_trade_pct"),
+    [
+        (0.0, 100.0, 95.0, 0.01),
+        (100_000.0, 0.0, 95.0, 0.01),
+        (100_000.0, 100.0, 100.0, 0.01),  # zero risk per share
+        (100_000.0, 100.0, 95.0, 0.0),
+    ],
+)
+def test_position_sizer_by_risk_returns_zero_for_invalid_inputs(
+    capital, entry_price, stop_loss, risk_per_trade_pct
+):
+    sizer = PositionSizer()
+
+    assert sizer.calculate_quantity_by_risk(capital, entry_price, stop_loss, risk_per_trade_pct) == 0

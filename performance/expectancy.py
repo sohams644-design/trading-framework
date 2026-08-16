@@ -41,3 +41,19 @@ def profit_factor(trades: list[TradeRecord]) -> float:
     if gross_loss == 0:
         return float("inf") if gross_profit > 0 else 0.0
     return gross_profit / gross_loss
+
+
+def expectancy(trades: list[TradeRecord]) -> float:
+    """Return the expected PnL of the next trade, in rupees.
+
+    ``win_rate * average_winner + (1 - win_rate) * average_loser``.
+    ``average_loser`` is already negative, so this is a signed sum, not a
+    difference. A negative expectancy means the system loses money on
+    average per trade regardless of how good any individual win looks.
+    """
+
+    if not trades:
+        return 0.0
+
+    rate = win_rate(trades)
+    return rate * average_winner(trades) + (1 - rate) * average_loser(trades)

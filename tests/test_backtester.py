@@ -1,5 +1,7 @@
 from datetime import datetime
 
+import pytest
+
 from config.orb import ORBStrategyConfig
 from config.risk import RiskConfig
 from domain.candle import Candle
@@ -8,6 +10,7 @@ from domain.trade_record import TradeRecord
 from execution.order_manager import OrderManager
 from execution.order_request_builder import OrderRequestBuilder
 from execution.simulated_execution_provider import SimulatedExecutionProvider
+from indicators.atr import ATR
 from indicators.context import IndicatorContext
 from indicators.opening_range import OpeningRange
 from indicators.relative_volume import RelativeVolume
@@ -52,6 +55,7 @@ def _build_engine() -> tuple[BacktestEngine, Portfolio]:
     indicator_context.register("vwap", VWAP())
     indicator_context.register("opening_range", OpeningRange())
     indicator_context.register("relative_volume", RelativeVolume(lookback_period=2))
+    indicator_context.register("atr", ATR(period=2))
 
     strategy = ORBStrategy("RELIANCE", config=ORBStrategyConfig())
     risk_manager = RiskManager(RiskConfig())
@@ -131,7 +135,7 @@ def test_backtest_engine_skips_hold_signals_without_calling_risk_or_execution():
 # --- Results ---
 
 
-def _trade(pnl: float) -> TradeRecord:
+def _trade(pnl: float, day: int = 30) -> TradeRecord:
     return TradeRecord(
         symbol="RELIANCE",
         direction=TradeDirection.BUY,
@@ -139,17 +143,20 @@ def _trade(pnl: float) -> TradeRecord:
         exit_price=100.0 + pnl,
         quantity=1,
         pnl=pnl,
-        entry_time=datetime(2026, 7, 30, 9, 30),
-        exit_time=datetime(2026, 7, 30, 10, 0),
+        entry_time=datetime(2026, 7, day, 9, 30),
+        exit_time=datetime(2026, 7, day, 10, 0),
     )
 
 
 def test_results_calculates_summary_statistics_from_trade_log():
     from portfolio.trade_log import TradeLog
 
+    # Two different days so Sharpe/Sortino/Calmar have >=2 daily
+    # observations to compute a ratio from -- same-day trades would collapse
+    # to a single daily PnL figure and every ratio would just come back 0.0.
     trade_log = TradeLog()
-    trade_log.record(_trade(100.0))
-    trade_log.record(_trade(-40.0))
+    trade_log.record(_trade(100.0, day=30))
+    trade_log.record(_trade(-40.0, day=31))
 
     results = Results().calculate(trade_log)
 
@@ -161,4 +168,16 @@ def test_results_calculates_summary_statistics_from_trade_log():
         average_loser=-40.0,
         profit_factor=2.5,
         max_drawdown=40.0,
+        expectancy=30.0,
+        average_r_multiple=0.0,
+        sharpe_ratio=pytest.approx(4.8107, rel=1e-3),
+        sortino_ratio=pytest.approx(11.9059, rel=1e-3),
+        calmar_ratio=pytest.approx(189.0),
+        max_consecutive_wins=1,
+        max_consecutive_losses=1,
+        exposure_pct=0.0,
+        average_trade_duration_minutes=30.0,
+        average_mae=0.0,
+        average_mfe=0.0,
+        total_charges=0.0,
     )

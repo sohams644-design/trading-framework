@@ -11,6 +11,7 @@ from domain.trade import TradeDirection
 from domain.trade_record import TradeRecord
 from execution.execution_result import ExecutionResult, OrderStatus
 from execution.order_request import OrderRequest
+from performance.charges_calculator import ChargesCalculator
 from portfolio.trade_log import TradeLog
 from risk.risk_context import RiskContext
 
@@ -19,6 +20,7 @@ from risk.risk_context import RiskContext
 class _OpenPosition:
     position: Position
     entry_time: datetime
+    stop_loss: float | None = None
 
 
 @dataclass(slots=True)
@@ -36,6 +38,7 @@ class Portfolio:
     realized_pnl: float = 0.0
     daily_realized_loss: float = 0.0
     trades_today: int = 0
+    charges_calculator: ChargesCalculator = field(default_factory=ChargesCalculator)
     _open_positions: dict[str, _OpenPosition] = field(default_factory=dict)
 
     @property
@@ -104,6 +107,7 @@ class Portfolio:
                 average_price=result.fill_price,
             ),
             entry_time=signal.timestamp,
+            stop_loss=signal.stop_loss,
         )
         self.trades_today += 1
 
@@ -115,23 +119,40 @@ class Portfolio:
             return None
 
         position = open_position.position
+        quantity = abs(position.quantity)
         self.cash += result.fill_price * position.quantity
-        pnl = (result.fill_price - position.average_price) * position.quantity
+        gross_pnl = (result.fill_price - position.average_price) * position.quantity
         direction = TradeDirection.BUY if position.quantity > 0 else TradeDirection.SELL
+
+        # A long round-trips buy-then-sell; a short round-trips sell-then-buy.
+        # STT and stamp duty are leg-specific in India, so which price is the
+        # buy leg and which is the sell leg depends on direction.
+        if direction is TradeDirection.BUY:
+            buy_price, sell_price = position.average_price, result.fill_price
+        else:
+            buy_price, sell_price = result.fill_price, position.average_price
+
+        charges = self.charges_calculator.calculate_intraday(buy_price, sell_price, quantity)
+        net_pnl = gross_pnl - charges.total
+        self.cash -= charges.total
 
         trade = TradeRecord(
             symbol=order.symbol,
             direction=direction,
             entry_price=position.average_price,
             exit_price=result.fill_price,
-            quantity=abs(position.quantity),
-            pnl=pnl,
+            quantity=quantity,
+            pnl=net_pnl,
             entry_time=open_position.entry_time,
             exit_time=signal.timestamp,
             reason=signal.reason,
+            charges=charges.total,
+            stop_loss=open_position.stop_loss,
+            mae=signal.metadata.get("mae"),
+            mfe=signal.metadata.get("mfe"),
         )
         self.trade_log.record(trade)
-        self.realized_pnl += pnl
-        if pnl < 0:
-            self.daily_realized_loss += -pnl
+        self.realized_pnl += net_pnl
+        if net_pnl < 0:
+            self.daily_realized_loss += -net_pnl
         return trade

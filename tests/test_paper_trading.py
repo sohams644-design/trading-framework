@@ -1,18 +1,22 @@
 from collections.abc import Iterator
 from datetime import datetime
 
+import pytest
+
 from config.live_feed import LiveFeedConfig
 from config.orb import ORBStrategyConfig
 from config.paper_trading import PaperTradingConfig
 from config.risk import RiskConfig
 from domain.candle import Candle
 from domain.trade import TradeDirection
+from indicators.atr import ATR
 from indicators.context import IndicatorContext
 from indicators.opening_range import OpeningRange
 from indicators.relative_volume import RelativeVolume
 from indicators.vwap import VWAP
 from market_data.interval import Interval
 from market_data.provider import MarketDataProvider
+from performance.charges_calculator import ChargesCalculator
 from performance.expectancy import win_rate
 from portfolio.portfolio import Portfolio
 from runtime.events import RuntimeEvent
@@ -72,6 +76,7 @@ def _context() -> IndicatorContext:
     context.register("vwap", VWAP())
     context.register("opening_range", OpeningRange())
     context.register("relative_volume", RelativeVolume(lookback_period=2))
+    context.register("atr", ATR(period=2))
     return context
 
 
@@ -111,8 +116,11 @@ def test_paper_trading_runs_a_full_trade_from_live_candles_to_trade_record():
     trade = runner.trade_log.records[0]
     assert trade.symbol == "RELIANCE"
     assert trade.direction is TradeDirection.BUY
-    assert trade.entry_price == 108.0
-    assert trade.exit_price == 110.0
+    # SimulatedExecutionProvider's default 5bps slippage moves fills
+    # slightly against the trade: buys fill a touch above the reference
+    # price (108.0), sells a touch below it (110.0).
+    assert trade.entry_price == pytest.approx(108.0 * 1.0005)
+    assert trade.exit_price == pytest.approx(110.0 * 0.9995)
     assert trade.reason == "end_of_day_exit"
     assert trade.pnl > 0
     assert runner.state.error_count == 0
@@ -124,9 +132,13 @@ def test_paper_trading_updates_portfolio_cash_and_realized_pnl():
     runner.run()
 
     trade = runner.trade_log.records[0]
-    expected_pnl = (trade.exit_price - trade.entry_price) * trade.quantity
-    assert runner.portfolio.realized_pnl == expected_pnl
-    assert runner.portfolio.cash == 100_000.0 + expected_pnl
+    gross_pnl = (trade.exit_price - trade.entry_price) * trade.quantity
+    charges = ChargesCalculator().calculate_intraday(
+        buy_price=trade.entry_price, sell_price=trade.exit_price, quantity=trade.quantity
+    )
+    expected_pnl = gross_pnl - charges.total
+    assert runner.portfolio.realized_pnl == pytest.approx(expected_pnl)
+    assert runner.portfolio.cash == pytest.approx(100_000.0 + expected_pnl)
     assert runner.portfolio.positions == {}
 
 

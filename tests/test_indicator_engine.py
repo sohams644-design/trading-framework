@@ -3,6 +3,7 @@ from datetime import datetime, time
 import pytest
 
 from domain.candle import Candle
+from indicators.atr import ATR
 from indicators.base import Indicator
 from indicators.context import IndicatorContext
 from indicators.opening_range import OpeningRange
@@ -192,4 +193,15 @@ def test_indicator_context_default_indicators_are_accessible():
     assert isinstance(context.vwap, VWAP)
     assert isinstance(context.opening_range, OpeningRange)
     assert isinstance(context.relative_volume, RelativeVolume)
+    assert isinstance(context.atr, ATR)
     assert context.vwap.ready is True
+
+
+def test_indicator_context_default_relative_volume_lookback_fits_orb_entry_window():
+    """RVOL's default lookback must be short enough to be ready inside an ORB
+    entry window; a 20-bar (100-minute) lookback would never be ready before
+    the window closed, silently blocking every entry."""
+
+    context = IndicatorContext.with_defaults()
+
+    assert context.relative_volume.lookback_period <= 10

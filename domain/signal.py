@@ -41,10 +41,14 @@ class Signal:
         price: float | None = None,
         reason: str | None = None,
         metadata: dict[str, Any] | None = None,
+        stop_loss: float | None = None,
+        target: float | None = None,
     ) -> "Signal":
         """Create a long-entry signal."""
 
-        return cls._build(symbol, SignalAction.BUY, timestamp, price, reason, metadata)
+        return cls._build(
+            symbol, SignalAction.BUY, timestamp, price, reason, metadata, stop_loss, target
+        )
 
     @classmethod
     def sell(
@@ -54,10 +58,14 @@ class Signal:
         price: float | None = None,
         reason: str | None = None,
         metadata: dict[str, Any] | None = None,
+        stop_loss: float | None = None,
+        target: float | None = None,
     ) -> "Signal":
         """Create a short-entry signal."""
 
-        return cls._build(symbol, SignalAction.SELL, timestamp, price, reason, metadata)
+        return cls._build(
+            symbol, SignalAction.SELL, timestamp, price, reason, metadata, stop_loss, target
+        )
 
     @classmethod
     def none(
@@ -122,12 +130,16 @@ class Signal:
         price: float | None,
         reason: str | None,
         metadata: dict[str, Any] | None,
+        stop_loss: float | None = None,
+        target: float | None = None,
     ) -> "Signal":
         return Signal(
             symbol=symbol.upper(),
             action=action,
             timestamp=timestamp,
             price=price,
+            stop_loss=stop_loss,
+            target=target,
             reason=reason,
             metadata=metadata or {},
         )

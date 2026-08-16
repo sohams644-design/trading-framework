@@ -48,9 +48,18 @@ class RiskManager:
             reason, message = limits_result
             return RiskDecision.rejected(reason, message)
 
-        quantity = self.position_sizer.calculate_quantity(
-            context.capital, signal.price, self.config.capital_allocation_pct
-        )
+        if signal.stop_loss is not None:
+            quantity = self.position_sizer.calculate_quantity_by_risk(
+                context.capital,
+                signal.price,
+                signal.stop_loss,
+                self.config.risk_per_trade_pct,
+                max_capital_allocation_pct=self.config.capital_allocation_pct,
+            )
+        else:
+            quantity = self.position_sizer.calculate_quantity(
+                context.capital, signal.price, self.config.capital_allocation_pct
+            )
         if quantity <= 0:
             return RiskDecision.rejected(
                 RejectReason.INSUFFICIENT_CAPITAL,
