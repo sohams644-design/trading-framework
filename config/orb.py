@@ -17,6 +17,9 @@ class ORBStrategyConfig:
     allow_long: bool = True
     exit_at_market_close: bool = True
     exit_on_opposite_breakout: bool = False
+    use_stop_loss: bool = True
+    use_profit_target: bool = True
+    risk_reward_ratio: float = 2.0
     session: MarketSession = field(default_factory=MarketSession)
 
     def __post_init__(self) -> None:

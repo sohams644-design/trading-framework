@@ -32,6 +32,9 @@ class ORBStrategy(BaseStrategy):
         self.position_state = PositionState.FLAT
         self.last_signal: Signal | None = None
         self._last_candle: Candle | None = None
+        self.entry_price: float | None = None
+        self.stop_loss: float | None = None
+        self.profit_target: float | None = None
 
     def generate_signal(self, candle: Candle, context: IndicatorContext) -> Signal:
         """Generate an ORB signal from indicator state."""
@@ -53,6 +56,9 @@ class ORBStrategy(BaseStrategy):
 
         self.position_state = PositionState.FLAT
         self.last_signal = None
+        self.entry_price = None
+        self.stop_loss = None
+        self.profit_target = None
 
     def _build_entry_signal(
         self,
@@ -70,6 +76,7 @@ class ORBStrategy(BaseStrategy):
 
         if self._long_entry(candle, context):
             self.position_state = PositionState.LONG
+            self._set_trade_levels(candle, context)
             return Signal.buy(
                 self.symbol,
                 candle.timestamp,
@@ -79,11 +86,88 @@ class ORBStrategy(BaseStrategy):
 
         if self._short_entry(candle, context):
             self.position_state = PositionState.SHORT
+            self._set_trade_levels(candle, context)
             return Signal.sell(
                 self.symbol,
                 candle.timestamp,
                 candle.close,
                 reason="orb_short_breakout",
+            )
+
+        return None
+
+    def _set_trade_levels(
+        self,
+        candle: Candle,
+        context: IndicatorContext,
+    ) -> None:
+        self.entry_price = candle.close
+
+        if self.position_state is PositionState.LONG:
+            self.stop_loss = context.opening_range.opening_low
+            risk = self.entry_price - self.stop_loss
+            self.profit_target = (
+                self.entry_price
+                + risk * self.config.risk_reward_ratio
+            )
+        elif self.position_state is PositionState.SHORT:
+            self.stop_loss = context.opening_range.opening_high
+            risk = self.stop_loss - self.entry_price
+            self.profit_target = (
+                self.entry_price
+                - risk * self.config.risk_reward_ratio
+            )
+
+    def _stop_loss_exit(
+        self,
+        candle: Candle,
+    ) -> Signal | None:
+        if self.stop_loss is None:
+            return None
+
+        if (
+            self.position_state is PositionState.LONG
+            and candle.low <= self.stop_loss
+        ):
+            return self._exit_current_position(
+                candle,
+                "stop_loss",
+            )
+
+        if (
+            self.position_state is PositionState.SHORT
+            and candle.high >= self.stop_loss
+        ):
+            return self._exit_current_position(
+                candle,
+                "stop_loss",
+            )
+
+        return None
+
+    def _profit_target_exit(
+        self,
+        candle: Candle,
+    ) -> Signal | None:
+        if self.profit_target is None:
+            return None
+
+        if (
+            self.position_state is PositionState.LONG
+            and candle.high >= self.profit_target
+        ):
+            return self._exit_current_position(
+                candle,
+                "profit_target",
+            )
+
+        if (
+            self.position_state is PositionState.SHORT
+            and candle.low <= self.profit_target
+        ):
+            return self._exit_current_position(
+                candle,
+                "profit_target",
             )
 
         return None
@@ -95,6 +179,14 @@ class ORBStrategy(BaseStrategy):
     ) -> Signal | None:
         if self.position_state is PositionState.FLAT:
             return None
+
+        stop_exit = self._stop_loss_exit(candle)
+        if stop_exit is not None:
+            return stop_exit
+
+        target_exit = self._profit_target_exit(candle)
+        if target_exit is not None:
+            return target_exit
 
         if self.config.exit_at_market_close and self.config.session.is_square_off_time(
             candle.timestamp
