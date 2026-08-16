@@ -61,6 +61,8 @@ class ORBStrategy(BaseStrategy):
     ) -> Signal | None:
         if self.position_state is not PositionState.FLAT:
             return None
+        if self.config.session.is_square_off_time(candle.timestamp):
+            return None
         if not self._entry_filters_ready(context):
             return None
         if not self._relative_volume_confirmed(context):
