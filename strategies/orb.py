@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 
 from config import ORBStrategyConfig
@@ -9,6 +10,8 @@ from domain.candle import Candle
 from domain.signal import Signal
 from indicators.context import IndicatorContext
 from strategies.base_strategy import BaseStrategy
+
+logger = logging.getLogger(__name__)
 
 
 class PositionState(Enum):
@@ -35,6 +38,7 @@ class ORBStrategy(BaseStrategy):
         self.entry_price: float | None = None
         self.stop_loss: float | None = None
         self.profit_target: float | None = None
+        self.trade_taken_today = False
 
     def generate_signal(self, candle: Candle, context: IndicatorContext) -> Signal:
         """Generate an ORB signal from indicator state."""
@@ -59,6 +63,7 @@ class ORBStrategy(BaseStrategy):
         self.entry_price = None
         self.stop_loss = None
         self.profit_target = None
+        self.trade_taken_today = False
 
     def _build_entry_signal(
         self,
@@ -66,6 +71,8 @@ class ORBStrategy(BaseStrategy):
         context: IndicatorContext,
     ) -> Signal | None:
         if self.position_state is not PositionState.FLAT:
+            return None
+        if self.trade_taken_today:
             return None
         if self.config.session.is_square_off_time(candle.timestamp):
             return None
@@ -76,7 +83,9 @@ class ORBStrategy(BaseStrategy):
 
         if self._long_entry(candle, context):
             self.position_state = PositionState.LONG
+            self.trade_taken_today = True
             self._set_trade_levels(candle, context)
+            self._log_trade_entry(candle, context)
             return Signal.buy(
                 self.symbol,
                 candle.timestamp,
@@ -86,7 +95,9 @@ class ORBStrategy(BaseStrategy):
 
         if self._short_entry(candle, context):
             self.position_state = PositionState.SHORT
+            self.trade_taken_today = True
             self._set_trade_levels(candle, context)
+            self._log_trade_entry(candle, context)
             return Signal.sell(
                 self.symbol,
                 candle.timestamp,
@@ -117,6 +128,36 @@ class ORBStrategy(BaseStrategy):
                 self.entry_price
                 - risk * self.config.risk_reward_ratio
             )
+
+    def _log_trade_entry(
+        self,
+        candle: Candle,
+        context: IndicatorContext,
+    ) -> None:
+        logger.info(
+            "%s\n"
+            "Opening range:\n"
+            "  High = %s\n"
+            "  Low = %s\n"
+            "Entry:\n"
+            "  %s\n"
+            "Stop:\n"
+            "  %s\n"
+            "Target:\n"
+            "  %s\n"
+            "RVOL:\n"
+            "  %s\n"
+            "VWAP:\n"
+            "  %s",
+            candle.timestamp,
+            context.opening_range.opening_high,
+            context.opening_range.opening_low,
+            self.entry_price,
+            self.stop_loss,
+            self.profit_target,
+            context.relative_volume.current_volume_ratio,
+            context.vwap.value,
+        )
 
     def _stop_loss_exit(
         self,
