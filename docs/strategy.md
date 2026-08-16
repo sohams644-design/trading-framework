@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 # Strategy: ORB Redesign
 
 This document is a structural review of `ORBStrategy` (Opening Range Breakout) as it stood after the 15:15 re-entry fix and the stop-loss/profit-target/logging additions, plus the redesign implemented on top of it. It answers the ten review questions, lists every flaw found, describes the new design, and explains every code change. All 263 tests in `tests/` pass under Python 3.11.
@@ -158,3 +159,68 @@ Even with the redesign above, none of this has been validated against real fills
 ## What I'd suggest doing next, and why I'm not suggesting more than this
 
 Per your explicit instruction, I'm not proposing parameter re-tuning (the ATR multipliers, R:R ratio, entry window minutes, etc. above are reasonable starting points, not backtested-optimal values) and I'm not claiming the redesign has been shown to improve returns — only that it removes the four concrete, code-verified sources of bias/inconsistency in §11. The next real step is #21.1: get real historical data into this repo (either your Zerodha credentials + a working historical-data fetch, or a CSV you already have) and Python 3.10+ set up in whatever environment will run it, then re-run the July 2026 RELIANCE backtest with the new code and compare the actual numbers — trade count, win rate, profit factor, and the new metrics (especially average R-multiple and MAE, which will show directly whether the tighter stop is cutting winners short or the trailing stop is doing its job) — against your original 17-trade report. Only that comparison, not this document, can tell you whether the redesign actually helped.
+=======
+# Strategy
+
+## Opening Range Breakout (`strategies/orb.py`)
+
+The strategy marks the high and low of the first `opening_range_minutes` of
+the session, then enters on the first candle that trades outside that range,
+provided two filters agree:
+
+- **VWAP**: a long needs `close > vwap`, a short needs `close < vwap`.
+- **Relative volume**: the candle's volume must be at least
+  `relative_volume_threshold` times the rolling average.
+
+There is no stop-loss and no profit target. Every position is held to the
+square-off time, so `end_of_day_exit` is the only exit reason that occurs in
+practice — `exit_on_opposite_breakout` is off by default.
+
+## Known defects
+
+A 58-session backtest across five NSE large caps (5-minute candles) surfaced
+three defects. All three are in the strategy, not the runtime.
+
+### 1. Entries are allowed after the square-off time
+
+`_build_exit_signal` returns `None` when the strategy is flat, so the
+square-off check never runs on a flat strategy. `_build_entry_signal` has no
+square-off guard of its own. The result is that after the 15:15 square-off
+closes a position, the strategy will happily open a new one at 15:20 or 15:25.
+
+Roughly a third of all trades in the sample were opened at or after 15:15.
+
+### 2. Position state desynchronises from the portfolio at a session boundary
+
+`_reset_if_new_session` clears `position_state` to `FLAT` on the first candle
+of a new day. The `Portfolio` is not reset — and must not be, since it owns
+real bookkeeping. If a position is still open at the end of a session (which
+defect 1 makes possible, by entering on the final candle of the day), the next
+morning the strategy believes it is flat while the portfolio still holds
+stock.
+
+### 3. Rejected signals still advance the strategy's position state
+
+`_build_entry_signal` assigns `self.position_state` *before* returning the
+signal, so the state changes whether or not the trade is ever executed. When
+the risk gate rejects the entry — `POSITION_ALREADY_OPEN`, a breached daily
+loss limit, insufficient capital — the strategy is left believing it holds a
+position it never opened.
+
+This is the most structural of the three: the strategy assumes its signals are
+always filled. Combined with defects 1 and 2 it produces overnight holds, where
+a stale position from a previous session is finally closed by an exit signal
+belonging to a *different*, never-executed entry.
+
+## Measured edge
+
+Across 336 trades on RELIANCE, TCS, INFY, HDFCBANK, and SBIN (2026-05-18 to
+2026-08-07), mean return per trade was **-1.3 bps**, 95% CI `[-7.5, +4.8]` —
+statistically indistinguishable from zero. Excluding the defect-1 trades it
+was **+2.4 bps**, 95% CI `[-5.8, +10.6]`, also indistinguishable from zero.
+
+NSE intraday equity round-trip costs are roughly 6-12 bps, none of which the
+backtest models. The strategy has no demonstrated edge over its cost floor,
+and fixing the three defects above is a correctness exercise, not something
+that would be expected to create one.
+>>>>>>> Stashed changes

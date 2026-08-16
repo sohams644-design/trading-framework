@@ -19,6 +19,7 @@ class ORBStrategyConfig:
     exit_on_opposite_breakout: bool = False
     use_stop_loss: bool = True
     use_profit_target: bool = True
+<<<<<<< Updated upstream
     risk_reward_ratio: float = 2.0
 
     # Only take a fresh breakout entry within this many minutes of the
@@ -48,6 +49,9 @@ class ORBStrategyConfig:
     # trade's running high/low-water mark, ratcheting only in its favor.
     trailing_atr_multiplier: float = 1.0
 
+=======
+    risk_reward_ratio: float = 1.0
+>>>>>>> Stashed changes
     session: MarketSession = field(default_factory=MarketSession)
 
     def __post_init__(self) -> None:

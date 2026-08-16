@@ -32,6 +32,21 @@ API_SECRET=your_kite_api_secret
 You also need an instrument dump at `data/instruments.csv` with at least
 `instrument_token` and `tradingsymbol` columns.
 
+## Backtesting
+
+Replays historical candles through the same runtime loop that paper and live
+trading use.
+
+```bash
+python run_backtest.py RELIANCE --from 2026-05-18 --to 2026-08-07
+```
+
+Options: `--exchange`, `--capital`, `--interval`, `--log-level`. History is
+fetched through the Zerodha provider, so the same daily login applies.
+
+Fills are simulated at candle close with no slippage, brokerage, or taxes, so
+reported PnL is optimistic by construction — see the note the summary prints.
+
 ## Paper trading
 
 Simulated fills against live market data. **No orders ever reach a broker.**
@@ -72,3 +87,8 @@ python -m pytest
 Version 1 architecture is frozen (see the freeze note in the architecture doc).
 Backtesting, the runtime engine, the live market feed, and paper trading are
 complete. Live order execution is deliberately **not** wired to an entry point.
+
+The ORB strategy itself has three known defects that a backtest surfaces: it
+can enter after the square-off time, its position state desynchronises from
+the portfolio across a session boundary, and it advances that state on signals
+the risk gate later rejects. See `docs/strategy.md`.
